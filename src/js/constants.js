@@ -3,7 +3,7 @@
 /* ============================================================
    CONSTANTS
    ============================================================ */
-const DB_NAME = 'SafeNofaEFS',
+const DB_NAME = 'SafeNovaEFS',
     DB_VERSION = 2,
     CONTAINER_LIMIT = 8 * 1024 * 1024 * 1024,   // 8 GB per container
     DEVICE_LIMIT = 20 * 1024 * 1024 * 1024,  // 20 GB total device display limit
@@ -11,7 +11,7 @@ const DB_NAME = 'SafeNofaEFS',
     ARGON2_MEM = 19456,                     // 19 MB memory cost (OWASP minimum)
     ARGON2_ITER = 2,                         // time cost (iterations)
     ARGON2_PAR = 1,                         // parallelism
-    VERIFY_TEXT = 'SafeNofaEFS-VERIFY-OK',
+    VERIFY_TEXT = 'SafeNovaEFS-VERIFY-OK',
     ICON_W = 84,
     ICON_H = 90;
 let GRID_X = 96,   // horizontal grid cell size
