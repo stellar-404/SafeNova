@@ -20,7 +20,7 @@ Key properties:
 
 -   **Multiple containers** — each with its own password and independent storage limit (8 GB per container)
 -   **Virtual filesystem** — nested folders, drag-to-reorder icons, customizable folder colors
--   **File operations** — upload (drag & drop or browse), download, copy, cut, paste, rename, delete
+-   **File operations** — upload (drag & drop or browse; folder upload with 4× parallel encryption), download, copy, cut, paste, rename, delete
 -   **Built-in viewers** — text editor, image viewer, audio/video player, PDF viewer
 -   **Hardware key support** — optionally use a WebAuthn passkey to strengthen the container salt
 -   **Session memory** — optionally remember your session per tab or per browser
@@ -138,7 +138,7 @@ The built-in scanner performs a deep analysis of the virtual disk image, encrypt
 | 14  | Empty folder chain detection   | O(n) memoized                                |
 | 15  | Position table cleanup         | Removes stale entries                        |
 | 16  | Folder position maps           | Creates missing position maps                |
-| 17  | Position entry completeness    | Auto-positions unplaced nodes                |
+| 17  | Position entry completeness    | Only check visited folders; auto-position on repair |
 | 18  | Position collision detection   | Relocates overlapping icons                  |
 | 19  | Grid alignment verification    | Snaps off-grid positions                     |
 | 20  | Folder depth analysis          | O(n) memoized                                |
@@ -149,10 +149,12 @@ The built-in scanner performs a deep analysis of the virtual disk image, encrypt
 | #   | Check                       | Repairs                                       |
 | --- | --------------------------- | --------------------------------------------- |
 | 1   | File data existence         | Removes VFS nodes missing from IndexedDB      |
-| 2   | Encryption IV integrity     | Coerces Array/base64 IVs → Uint8Array         |
+| 2   | Encryption IV integrity     | Accepts Array/Uint8Array/ArrayBuffer (canonical is plain Array); coerces base64 strings; purges only if truly invalid |
 | 3   | File blob integrity         | Resets declared size to 0 if blob is empty    |
 | 4   | Orphaned storage records    | Deletes DB records not referenced by VFS      |
 | 5   | Record container binding    | Fixes records bound to wrong container        |
 | 6   | Container size consistency  | Recalculates totalSize from VFS               |
 
-Before auto-repair runs, a confirmation dialog recommends exporting the container as a `.safenova` backup. Closing the scanner modal cancels any running scan.
+Before auto-repair runs, a confirmation dialog recommends exporting the container as a `.safenova` backup. Closing the scanner modal cancels any running scan. After a successful repair, a verification scan runs automatically to confirm all issues are resolved.
+
+If auto-repair cannot fix the remaining issues, a **Deep Clean** option becomes available. It performs a full structural rebuild in a single O(n) pass — keeping only nodes that have real encrypted data behind them and discarding everything else. DB records are removed in one batch transaction. After deep clean, a verification scan runs automatically.

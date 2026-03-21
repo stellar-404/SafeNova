@@ -40,8 +40,11 @@ async function uploadFiles(files) {
 
     showLoading(`Encrypting ${files.length} file${files.length > 1 ? 's' : ''}...`);
     let ok = 0;
-    for (const f of files) {
-        try {
+    const fileArr = Array.from(files);
+    const BATCH = 4;
+    for (let i = 0; i < fileArr.length; i += BATCH) {
+        const batch = fileArr.slice(i, i + BATCH);
+        const results = await Promise.allSettled(batch.map(async f => {
             const name = sanitizeFilename(f.name);
             const buf = await f.arrayBuffer();
             const mime = f.type || getMime(name);
@@ -52,8 +55,13 @@ async function uploadFiles(files) {
                 parentId: App.folder, ctime: Date.now(), mtime: Date.now()
             });
             await DB.saveFile({ id: nodeId, cid: App.container.id, iv: Array.from(iv), blob });
-            ok++;
-        } catch (e) { console.error('upload error', e); toast('Failed to encrypt: ' + f.name, 'error'); }
+            return true;
+        }));
+        for (let j = 0; j < results.length; j++) {
+            if (results[j].status === 'fulfilled') ok++;
+            else { console.error('upload error', batch[j].name, results[j].reason); toast('Failed to encrypt: ' + batch[j].name, 'error'); }
+        }
+        showLoading(`Encrypting... ${Math.min(i + BATCH, fileArr.length)}/${fileArr.length}`);
     }
     await saveVFS();
     Desktop._patchIcons();
@@ -116,12 +124,18 @@ async function _uploadDirEntry(dirEntry, targetFolderId, depth) {
     const folderId = uid(), now = Date.now();
     VFS.add({ id: folderId, type: 'folder', name, parentId: targetFolderId, ctime: now, mtime: now });
     const entries = await _readAllEntries(dirEntry.createReader());
-    for (const entry of entries) {
-        if (entry.isDirectory) {
-            await _uploadDirEntry(entry, folderId, depth + 1);
-        } else {
-            await _uploadFileEntry(entry, folderId);
-        }
+    const fileEntries = entries.filter(e => e.isFile);
+    const subDirEntries = entries.filter(e => e.isDirectory);
+    // Encrypt files in this directory in parallel batches
+    const BATCH = 4;
+    for (let i = 0; i < fileEntries.length; i += BATCH) {
+        await Promise.allSettled(
+            fileEntries.slice(i, i + BATCH).map(e => _uploadFileEntry(e, folderId))
+        );
+    }
+    // Recurse into subdirectories sequentially
+    for (const subDir of subDirEntries) {
+        await _uploadDirEntry(subDir, folderId, depth + 1);
     }
     return true;
 }

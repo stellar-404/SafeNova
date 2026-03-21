@@ -758,10 +758,22 @@ async function _runDbChecks(repair, isAborted) {
         if (repair && fixed.length) vfsFileIds = new Set(VFS.fileIds());
     }
 
-    // 2. Encryption IV integrity — attempt to coerce IV before declaring unrecoverable
+    // 2. Encryption IV integrity
+    // Files are stored with iv = Array.from(Uint8Array(12)) — plain Array is the canonical format.
+    // Uint8Array / ArrayBuffer / ArrayBufferView are also accepted.
+    // Only flag if iv is missing, wrong length, or an unrecognized type.
     {
         if (_abort()) return steps;
         const issues = [], fixed = [];
+
+        function ivValid(iv) {
+            if (!iv) return false;
+            if (Array.isArray(iv)) return iv.length >= 12;
+            if (iv instanceof Uint8Array || ArrayBuffer.isView(iv)) return iv.byteLength >= 12;
+            if (iv instanceof ArrayBuffer) return iv.byteLength >= 12;
+            return false;
+        }
+
         for (const [id, rec] of dbFileMap) {
             if (_abort()) break;
             if (!vfsFileIds.has(id)) continue;
@@ -772,34 +784,35 @@ async function _runDbChecks(repair, isAborted) {
                 if (repair) {
                     VFS.remove(id);
                     await DB.deleteFile(id);
-                    fixed.push(`Purged unrecoverable file "${node?.name || id}"`);
+                    fixed.push(`Purged file missing IV: "${node?.name || id}"`);
                 }
                 continue;
             }
 
-            // Try to coerce IV into a valid Uint8Array (handles Array, base64 string, etc.)
-            let ivOk = rec.iv instanceof Uint8Array || rec.iv instanceof ArrayBuffer || ArrayBuffer.isView(rec.iv);
-            if (!ivOk && repair) {
+            let ok = ivValid(rec.iv);
+
+            // Try to salvage IVs stored as unusual types (e.g. base64 string in very old data)
+            if (!ok && repair) {
                 let coerced = null;
-                if (Array.isArray(rec.iv)) {
-                    coerced = new Uint8Array(rec.iv);
-                } else if (typeof rec.iv === 'string') {
+                const origType = typeof rec.iv;
+                if (typeof rec.iv === 'string') {
                     try { coerced = new Uint8Array(atob(rec.iv).split('').map(c => c.charCodeAt(0))); } catch {}
                 }
                 if (coerced && coerced.length >= 12) {
-                    rec.iv = coerced;
+                    rec.iv = Array.from(coerced); // store as canonical Array format
                     await DB.saveFile(rec);
-                    fixed.push(`Coerced IV for "${node?.name || id}" (${typeof rec.iv === 'string' ? 'base64' : 'array'} → Uint8Array)`);
-                    ivOk = true;
+                    fixed.push(`Coerced IV for "${node?.name || id}" (${origType} → array)`);
+                    ok = true;
                 }
             }
 
-            if (!ivOk) {
-                issues.push({ sev: 'critical', msg: `"${node?.name || id}": invalid encryption IV format` });
+            if (!ok) {
+                const ivDesc = Array.isArray(rec.iv) ? `array[${rec.iv.length}]` : typeof rec.iv;
+                issues.push({ sev: 'critical', msg: `"${node?.name || id}": invalid IV (${ivDesc})` });
                 if (repair) {
                     VFS.remove(id);
                     await DB.deleteFile(id);
-                    fixed.push(`Purged unrecoverable file "${node?.name || id}"`);
+                    fixed.push(`Purged file with invalid IV: "${node?.name || id}"`);
                 }
             }
         }
@@ -886,12 +899,14 @@ function _openScannerModal() {
     const log = document.getElementById('scanner-log'),
         summary = document.getElementById('scanner-summary'),
         repairBtn = document.getElementById('scanner-repair'),
+        deepCleanBtn = document.getElementById('scanner-deep-clean'),
         startBtn = document.getElementById('scanner-start'),
         closeBtn = document.getElementById('scanner-close');
 
     log.innerHTML = '';
     summary.style.display = 'none';
     repairBtn.style.display = 'none';
+    deepCleanBtn.style.display = 'none';
     startBtn.style.display = '';
     startBtn.disabled = false;
     startBtn.textContent = 'Start Scan';
@@ -905,6 +920,7 @@ function _openScannerModal() {
         startBtn.disabled = true;
         startBtn.textContent = 'Scanning…';
         repairBtn.style.display = 'none';
+        deepCleanBtn.style.display = 'none';
         _runScanAnimated(false);
     };
 
@@ -913,6 +929,7 @@ function _openScannerModal() {
         _showRepairConfirm().then(proceed => {
             if (!proceed) return;
             repairBtn.style.display = 'none';
+            deepCleanBtn.style.display = 'none';
             startBtn.style.display = 'none';
             log.innerHTML = '';
             summary.style.display = 'none';
@@ -920,7 +937,62 @@ function _openScannerModal() {
         });
     };
 
+    deepCleanBtn.onclick = () => {
+        _showRepairConfirm().then(proceed => {
+            if (!proceed) return;
+            repairBtn.style.display = 'none';
+            deepCleanBtn.style.display = 'none';
+            startBtn.style.display = 'none';
+            log.innerHTML = '';
+            summary.style.display = 'none';
+            _runDeepCleanAnimated();
+        });
+    };
+
     closeBtn.onclick = () => { _aborted = true; Overlay.hide(); };
+
+    async function _runDeepCleanAnimated() {
+        log.innerHTML = '';
+        summary.style.display = 'none';
+        _aborted = false;
+
+        // Show 3 progress rows updated via callback
+        const rowStorage = _addScanRow(log, 'Scanning storage records…');
+        const rowPurge   = _addScanRow(log, 'Purging dead nodes…');
+        const rowClean   = _addScanRow(log, 'Cleaning storage records…');
+        log.scrollTop = log.scrollHeight;
+        await _delay(20);
+
+        let phase = 0;
+        const result = await _runDeepClean(() => _aborted, (msg) => {
+            if (phase === 0) { _resolveScanRow(rowStorage, 'pass', 'OK'); phase = 1; }
+            else if (phase === 1) { _resolveScanRow(rowPurge, 'pass', 'OK'); phase = 2; }
+        });
+        if (_aborted) return;
+
+        // Resolve remaining rows
+        if (phase === 0) _resolveScanRow(rowStorage, 'pass', 'OK');
+        _resolveScanRow(rowPurge, result.removed > 0 ? 'pass' : 'warn',
+            result.removed > 0 ? `${result.removed} node${result.removed !== 1 ? 's' : ''} removed` : 'Nothing found');
+        _resolveScanRow(rowClean, 'pass', 'OK');
+        log.scrollTop = log.scrollHeight;
+
+        if (result.removed > 0) {
+            await saveVFS();
+            Desktop.render();
+            await _delay(600);
+            if (!_aborted) await _runScanAnimated(false);
+        } else {
+            summary.style.display = '';
+            summary.className = 'scanner-summary critical';
+            summary.innerHTML = `<svg width="20" height="20" viewBox="0 0 20 20" fill="none"><circle cx="10" cy="10" r="8.5" stroke="currentColor" stroke-width="1.4"/><path d="M10 5.5v5.5" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"/><circle cx="10" cy="14" r="0.9" fill="currentColor"/></svg>
+                <span class="scanner-summary-text"><strong>Could not be cleaned automatically.</strong> The container may require manual rebuilding from your backup.</span>`;
+            startBtn.style.display = '';
+            startBtn.disabled = false;
+            startBtn.textContent = 'Done';
+        }
+        return;
+    }
 
     async function _runScanAnimated(repair) {
         log.innerHTML = '';
@@ -968,16 +1040,22 @@ function _openScannerModal() {
 
         summary.style.display = '';
         if (repair && totalFixed > 0) {
-            summary.className = 'scanner-summary repaired';
-            summary.innerHTML = `<svg width="20" height="20" viewBox="0 0 16 16" fill="none"><path d="M4 8l3 3 5-6" stroke="currentColor" stroke-width="1.6" stroke-linecap="square" stroke-linejoin="round"/></svg>
-                <span class="scanner-summary-text"><strong>Repair complete.</strong> ${totalFixed} issue${totalFixed !== 1 ? 's' : ''} automatically resolved. Container integrity restored.</span>`;
             await saveVFS();
             Desktop.render();
+            // Auto-re-scan to verify the repair result
+            summary.className = 'scanner-summary repaired';
+            summary.innerHTML = `<svg width="20" height="20" viewBox="0 0 16 16" fill="none"><path d="M4 8l3 3 5-6" stroke="currentColor" stroke-width="1.6" stroke-linecap="square" stroke-linejoin="round"/></svg>
+                <span class="scanner-summary-text"><strong>${totalFixed} issue${totalFixed !== 1 ? 's' : ''} repaired.</strong> Running verification scan…</span>`;
+            summary.style.display = '';
+            await _delay(900);
+            if (!_aborted) { await _runScanAnimated(false); }
+            return;
         } else if (repair && totalFixed === 0 && totalIssues > 0) {
-            // Repair ran but couldn't fix the remaining issues
-            summary.className = 'scanner-summary issues';
+            // Repair ran but couldn't fix the remaining issues — offer Deep Clean
+            summary.className = 'scanner-summary critical';
             summary.innerHTML = `<svg width="20" height="20" viewBox="0 0 20 20" fill="none"><circle cx="10" cy="10" r="8.5" stroke="currentColor" stroke-width="1.4"/><path d="M10 5.5v5.5" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"/><circle cx="10" cy="14" r="0.9" fill="currentColor"/></svg>
-                <span class="scanner-summary-text"><strong>${totalIssues} issue${totalIssues !== 1 ? 's' : ''} could not be resolved.</strong> These issues require manual intervention or the data is unrecoverable.</span>`;
+                <span class="scanner-summary-text"><strong>${totalIssues} issue${totalIssues !== 1 ? 's' : ''} could not be auto-repaired.</strong> Try <em>Deep Clean</em> to purge phantom nodes and rebuild the structure. A backup is strongly recommended first.</span>`;
+            deepCleanBtn.style.display = '';
         } else if (allPass) {
             summary.className = 'scanner-summary healthy';
             summary.innerHTML = `<svg width="20" height="20" viewBox="0 0 24 26" fill="none"><path d="M12 3L3.5 7.5v4.5c0 5.2 3.6 10 8.5 11.5 4.9-1.5 8.5-6.3 8.5-11.5V7.5L12 3z" stroke="currentColor" stroke-width="1.5" fill="none"/><path d="M9 13l2.5 2.5 4-4.5" stroke="currentColor" stroke-width="1.6" stroke-linecap="square" stroke-linejoin="round"/></svg>
@@ -996,6 +1074,36 @@ function _openScannerModal() {
     }
 
     Overlay.show('modal-scanner');
+}
+
+/* ── Deep Clean — purge all phantom/empty nodes that normal repair can't fix ── */
+// O(n) rebuild: marks ancestors of real files as "keep", deletes everything else.
+async function _runDeepClean(isAborted, onProgress) {
+    const _abort = () => isAborted?.();
+
+    // 1. Load DB records (real data)
+    onProgress?.('Scanning storage records…');
+    const allDbFiles = await DB.getFilesByCid(App.container.id);
+    if (_abort()) return { removed: 0 };
+    const dbIds = new Set(allDbFiles.map(f => f.id));
+
+    // 2. Determine truly live file IDs: exist in VFS AND have a DB record
+    const allVfsFileIds = VFS.fileIds();
+    const liveFileIds = allVfsFileIds.filter(id => dbIds.has(id));
+    if (_abort()) return { removed: 0 };
+
+    // 3. Single-pass bulk purge via VFS.purgeDeadBranches (O(n))
+    onProgress?.(`Purging dead nodes…`);
+    const removed = VFS.purgeDeadBranches(liveFileIds);
+    if (_abort()) return { removed: 0 };
+
+    // 4. Remove orphaned DB records in a single IndexedDB transaction
+    onProgress?.('Cleaning storage records…');
+    const liveNow = new Set(VFS.fileIds());
+    const orphanIds = allDbFiles.filter(f => !liveNow.has(f.id)).map(f => f.id);
+    if (orphanIds.length) await DB.deleteFiles(orphanIds);
+
+    return { removed };
 }
 
 /* ── Repair confirmation dialog (shown above scanner overlay) ─────── */

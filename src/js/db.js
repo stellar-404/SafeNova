@@ -43,6 +43,15 @@ const DB = (() => {
         getFile: (id) => wrap(ro('files').get(id)),
         getFilesByCid: (cid) => wrap(ro('files').index('cid').getAll(cid)),
         deleteFile: (id) => wrap(rw('files').delete(id)),
+        // Batch-delete multiple file records in a single IndexedDB transaction
+        deleteFiles: (ids) => new Promise((res, rej) => {
+            if (!ids || !ids.length) { res(); return; }
+            const tx = _db.transaction('files', 'readwrite');
+            const store = tx.objectStore('files');
+            ids.forEach(id => store.delete(id));
+            tx.oncomplete = () => res();
+            tx.onerror = () => rej(tx.error);
+        }),
 
         /* vfs */
         saveVFS: (cid, iv, blob) => wrap(rw('vfs').put({ cid, iv, blob })),

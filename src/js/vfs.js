@@ -520,21 +520,42 @@ const VFS = (() => {
                     folderKids.get(pid).push(id);
                 }
             }
+            // Iterative post-order DFS — no recursion to avoid stack overflow on deep chains
             const emptyCache = new Map();
-            function emptyDepth(fid) {
-                if (emptyCache.has(fid)) return emptyCache.get(fid);
-                const cc = childCount[fid];
-                if (!cc || (cc.files === 0 && cc.folders === 0)) { emptyCache.set(fid, 1); return 1; }
-                if (cc.files > 0) { emptyCache.set(fid, 0); return 0; }
-                let maxD = 0;
-                for (const sub of (folderKids.get(fid) || [])) maxD = Math.max(maxD, emptyDepth(sub));
-                const result = maxD > 0 ? maxD + 1 : 0;
-                emptyCache.set(fid, result);
-                return result;
+            for (const startId of allIds) {
+                if (_nodes[startId]?.type !== 'folder' || startId === 'root') continue;
+                if (emptyCache.has(startId)) continue;
+                const stack = [{ id: startId, childIdx: 0 }];
+                while (stack.length) {
+                    const top = stack[stack.length - 1];
+                    const kids = folderKids.get(top.id) || [];
+                    let pushed = false;
+                    while (top.childIdx < kids.length) {
+                        const kid = kids[top.childIdx++];
+                        if (!emptyCache.has(kid) && _nodes[kid]?.type === 'folder') {
+                            stack.push({ id: kid, childIdx: 0 });
+                            pushed = true;
+                            break;
+                        }
+                    }
+                    if (!pushed) {
+                        stack.pop();
+                        const cc = childCount[top.id];
+                        if (!cc || (cc.files === 0 && cc.folders === 0)) {
+                            emptyCache.set(top.id, 1);
+                        } else if (cc.files > 0) {
+                            emptyCache.set(top.id, 0);
+                        } else {
+                            let maxD = 0;
+                            for (const sub of (folderKids.get(top.id) || [])) maxD = Math.max(maxD, emptyCache.get(sub) || 0);
+                            emptyCache.set(top.id, maxD > 0 ? maxD + 1 : 0);
+                        }
+                    }
+                }
             }
             for (const id of allIds) {
                 if (_nodes[id]?.type !== 'folder' || id === 'root') continue;
-                const d = emptyDepth(id);
+                const d = emptyCache.get(id) || 0;
                 if (d > 5) log('warn', `"${_nodes[id].name}": empty folder chain ${d} levels deep`);
             }
         });
@@ -569,12 +590,18 @@ const VFS = (() => {
             }
         });
 
-        // 17. Position completeness — every child should have a position entry
+        // 17. Position completeness — only flag if the parent folder has been visited
+        // Positions are lazily assigned when a folder is first opened.
+        // Files in never-opened folders naturally have no position yet — not an error.
         step('Position entry completeness', (log, fix) => {
             for (const id of allIds) {
                 if (id === 'root') continue;
                 const pid = _nodes[id].parentId;
-                if (pid && _pos[pid] && !_pos[pid][id]) {
+                if (!pid || !_pos[pid]) continue;
+                const posMap = _pos[pid];
+                // If no siblings have positions, the folder was never opened — skip
+                if (Object.keys(posMap).length === 0) continue;
+                if (!posMap[id]) {
                     log('warn', `"${_nodes[id]?.name || id}" has no position in parent folder`);
                     if (repair) {
                         const ap = autoPos(pid, 0, null);
@@ -661,9 +688,40 @@ const VFS = (() => {
         return Object.keys(_nodes).filter(id => _nodes[id]?.type === 'file');
     }
 
+    // Bulk-purge every node that is NOT an ancestor of any live file.
+    // O(n) — single pass: mark ancestors, then delete everything else.
+    // Returns count of removed nodes.
+    function purgeDeadBranches(liveFileIds) {
+        // Walk ancestor chain for every live file — mark those nodes as \"keep\"
+        const keep = new Set(['root']);
+        for (const id of liveFileIds) {
+            let cur = id;
+            while (cur && !keep.has(cur)) {
+                keep.add(cur);
+                cur = _nodes[cur]?.parentId;
+            }
+        }
+        // Delete all nodes not in keep — single pass, no child scans
+        let removed = 0;
+        for (const id of Object.keys(_nodes)) {
+            if (!keep.has(id)) {
+                delete _nodes[id];
+                removed++;
+            }
+        }
+        // Rebuild _pos: drop maps for gone folders, drop entries for gone nodes
+        for (const pid of Object.keys(_pos)) {
+            if (!keep.has(pid)) { delete _pos[pid]; continue; }
+            for (const nid of Object.keys(_pos[pid] || {})) {
+                if (!keep.has(nid)) delete _pos[pid][nid];
+            }
+        }
+        return removed;
+    }
+
     return {
         init, fromObj, toObj, children, node, add, remove, rename, move, wouldCycle,
         getPos, setPos, delPos, totalSize, breadcrumb, fullPath, autoPos, hasChildNamed,
-        remapPositions, check, fileIds
+        remapPositions, check, fileIds, purgeDeadBranches
     };
 })();

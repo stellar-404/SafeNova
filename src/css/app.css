@@ -2728,9 +2728,23 @@ input[type="password"]::-ms-clear {
     border: 1px solid color-mix(in srgb, #34d399 25%, transparent);
     color: #34d399;
 }
+.scanner-summary.critical {
+    background: color-mix(in srgb, #e74856 8%, var(--bg2));
+    border: 1px solid color-mix(in srgb, #e74856 25%, transparent);
+    color: #e74856;
+}
 .scanner-summary svg { flex-shrink: 0; }
 .scanner-summary-text { line-height: 1.5; }
 .scanner-summary-text strong { font-weight: 600; color: var(--text); }
+.btn-deep-clean {
+    background: color-mix(in srgb, #e74856 15%, var(--bg2));
+    border-color: color-mix(in srgb, #e74856 40%, transparent);
+    color: #e74856;
+}
+.btn-deep-clean:hover {
+    background: color-mix(in srgb, #e74856 25%, var(--bg2));
+    border-color: #e74856;
+}
 
 /* ── Repair confirmation overlay (above scanner modal) ── */
 .repair-confirm-overlay {
