@@ -1,6 +1,79 @@
 'use strict';
 
 /* ============================================================
+   SESSION ENCRYPTION  —  AES-256-GCM encrypted session storage
+
+   Design:
+   • The 32-byte session key is generated once and kept in
+     sessionStorage ('snv-sk'). It never touches localStorage.
+   • Tab-scope sessions  → snv-s-{cid}  in sessionStorage.
+   • Browser-scope sessions → snv-sb-{cid} in localStorage.
+   • When the browser closes, sessionStorage is wiped → the key
+     is gone → any localStorage blobs become undecryptable.
+   • An attacker who dumps only localStorage cannot recover
+     passwords without also reading the current sessionStorage.
+   ============================================================ */
+let _sessionKey = null;
+
+async function _getOrCreateSessionKey() {
+    if (_sessionKey) return _sessionKey;
+    const stored = sessionStorage.getItem('snv-sk');
+    if (stored) {
+        try {
+            const raw = Uint8Array.from(atob(stored), ch => ch.charCodeAt(0));
+            _sessionKey = await crypto.subtle.importKey('raw', raw, { name: 'AES-GCM' }, false, ['encrypt', 'decrypt']);
+            return _sessionKey;
+        } catch { /* corrupted — regenerate below */ }
+    }
+    const raw = crypto.getRandomValues(new Uint8Array(32));
+    const exp = await crypto.subtle.importKey('raw', raw, { name: 'AES-GCM' }, true, ['encrypt', 'decrypt']);
+    const exported = await crypto.subtle.exportKey('raw', exp);
+    sessionStorage.setItem('snv-sk', btoa(String.fromCharCode(...new Uint8Array(exported))));
+    // Re-import as non-extractable for forward secrecy within this session
+    _sessionKey = await crypto.subtle.importKey('raw', exported, { name: 'AES-GCM' }, false, ['encrypt', 'decrypt']);
+    return _sessionKey;
+}
+
+async function saveSession(cid, password, scope) {
+    const key = await _getOrCreateSessionKey(),
+        iv = crypto.getRandomValues(new Uint8Array(12)),
+        ct = await crypto.subtle.encrypt({ name: 'AES-GCM', iv }, key, new TextEncoder().encode(password)),
+        blob = new Uint8Array(12 + ct.byteLength);
+    blob.set(iv, 0);
+    blob.set(new Uint8Array(ct), 12);
+    const b64 = btoa(String.fromCharCode(...blob));
+    if (scope === 'browser') {
+        localStorage.setItem('snv-sb-' + cid, b64);
+        sessionStorage.removeItem('snv-s-' + cid);
+    } else {
+        sessionStorage.setItem('snv-s-' + cid, b64);
+        localStorage.removeItem('snv-sb-' + cid);
+    }
+}
+
+async function loadSession(cid) {
+    const b64 = sessionStorage.getItem('snv-s-' + cid) || localStorage.getItem('snv-sb-' + cid);
+    if (!b64) return null;
+    try {
+        const key = await _getOrCreateSessionKey(),
+            blob = Uint8Array.from(atob(b64), ch => ch.charCodeAt(0)),
+            iv = blob.slice(0, 12),
+            ct = blob.slice(12),
+            dec = await crypto.subtle.decrypt({ name: 'AES-GCM', iv }, key, ct);
+        return new TextDecoder().decode(dec);
+    } catch { return null; }
+}
+
+function clearSession(cid) {
+    sessionStorage.removeItem('snv-s-' + cid);
+    localStorage.removeItem('snv-sb-' + cid);
+}
+
+function hasSession(cid) {
+    return !!(sessionStorage.getItem('snv-s-' + cid) || localStorage.getItem('snv-sb-' + cid));
+}
+
+/* ============================================================
    APP STATE
    ============================================================ */
 const App = {
@@ -70,11 +143,7 @@ const App = {
 
     async lockContainer() {
         const cid = this.container?.id;
-        // Kill stored session so password is not remembered after locking
-        if (cid) {
-            sessionStorage.removeItem('twc-s-' + cid);
-            localStorage.removeItem('twc-s-' + cid);
-        }
+        if (cid) clearSession(cid);
         this.key = null;
         this.container = null;
         this.folder = 'root';

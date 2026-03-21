@@ -7,7 +7,7 @@ const DB_NAME = 'SafeNovaEFS',
     DB_VERSION = 2,
     CONTAINER_LIMIT = 8 * 1024 * 1024 * 1024,   // 8 GB per container
     DEVICE_LIMIT = 20 * 1024 * 1024 * 1024,     // 20 GB total device display limit
-    PBKDF2_ITER = 200_000,                      // legacy fallback
+
     ARGON2_MEM = 19456,                         // 19 MB memory cost (OWASP minimum)
     ARGON2_ITER = 2,                            // time cost (iterations)
     ARGON2_PAR = 1,                             // parallelism

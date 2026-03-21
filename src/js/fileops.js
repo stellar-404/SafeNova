@@ -1278,12 +1278,7 @@ async function importContainerFile(file) {
             const salt = Array.from(Uint8Array.from(atob(saltB64), ch => ch.charCodeAt(0))),
                 verIv = Array.from(Uint8Array.from(atob(verIvB64), ch => ch.charCodeAt(0)));
 
-            // Detect format version — v3 has encrypted file manifest
-            const filesEl = doc.querySelector('files');
-            const isV3 = filesEl && filesEl.getAttribute('encrypted') === 'true';
-            const versionStr = doc.querySelector('safenova')?.getAttribute('version');
-
-            if (isV3 && entries['meta/2'] && entries['meta/3']) {
+            if (entries['meta/2'] && entries['meta/3']) {
                 // v3: import without password — encrypted workspace stored as-is, expanded on first unlock
                 const existing2 = await DB.getContainers();
                 let name = nameRaw, suffix = 2;
@@ -1306,44 +1301,7 @@ async function importContainerFile(file) {
                 return;
             }
 
-            // v2 legacy: plaintext <files> in XML
-            const fileManifest = [...doc.querySelectorAll('files > file')].map(el => ({
-                id: el.getAttribute('id'),
-                ivB64: el.getAttribute('iv'),
-                offset: parseInt(el.getAttribute('offset'), 10),
-                size: parseInt(el.getAttribute('size'), 10),
-            }));
-
-            const existing = await DB.getContainers();
-            let name = nameRaw, suffix = 2;
-            while (existing.find(c => c.name.toLowerCase() === name.toLowerCase()))
-                name = nameRaw + ' (' + suffix++ + ')';
-
-            const vfsIvArr = Array.from(entries['meta/0']),
-                vfsBlobB64 = buf2b64(entries['meta/1']),
-                workspace = entries['safenova_efs/workspace.bin'];
-
-            const newCid = uid();
-            const newCont = { id: newCid, name, createdAt, salt, verIv, verBlob, totalSize };
-            const savedIds = [];
-            await DB.saveContainer(newCont);
-            await DB.saveVFS(newCid, vfsIvArr, vfsBlobB64);
-            try {
-                for (const m of fileManifest) {
-                    const iv = Array.from(Uint8Array.from(atob(m.ivB64), ch => ch.charCodeAt(0))),
-                        blob = workspace.slice(m.offset, m.offset + m.size).buffer;
-                    await DB.saveFile({ id: m.id, cid: newCid, iv, blob });
-                    savedIds.push(m.id);
-                }
-            } catch (saveErr) {
-                for (const fid of savedIds) { try { await DB.deleteFile(fid); } catch (_) { } }
-                try { await DB.deleteVFS(newCid); } catch (_) { }
-                try { await DB.deleteContainer(newCid); } catch (_) { }
-                throw new Error('Import rolled back: ' + saveErr.message);
-            }
-            hideLoading();
-            toast(`Container "${name}" imported`, 'success');
-            await Home.render();
+            throw new Error('Unsupported container format. Only SafeNova v3 (.safenova) exports are supported.');
 
         } else {
             throw new Error('Unsupported file format. Please use a .safenova export.');
@@ -1353,62 +1311,6 @@ async function importContainerFile(file) {
         toast('Import failed: ' + e.message, 'error');
         console.error(e);
     }
-}
-
-/** Prompt user for password to decrypt encrypted file manifest (v3 format) */
-function _askImportPassword(containerName, salt, verIv, verBlob, zipEntries) {
-    return new Promise(resolve => {
-        document.getElementById('imp-name').textContent = containerName;
-        document.getElementById('imp-pw').value = '';
-        document.getElementById('imp-error').innerHTML = '';
-        Overlay.show('modal-import-pw');
-        setTimeout(() => document.getElementById('imp-pw').focus(), 100);
-
-        const cleanup = () => {
-            Overlay.hide();
-            btnOk.onclick = null;
-            btnCancel.onclick = null;
-            btnClose.onclick = null;
-            pwInput.onkeydown = null;
-        };
-
-        const btnOk = document.getElementById('imp-ok'),
-            btnCancel = document.getElementById('imp-cancel'),
-            btnClose = document.getElementById('imp-close'),
-            pwInput = document.getElementById('imp-pw'),
-            errEl = document.getElementById('imp-error');
-
-        const doImport = async () => {
-            const pw = pwInput.value;
-            if (!pw) { errEl.textContent = 'Enter password'; return; }
-            errEl.textContent = '';
-            btnOk.disabled = true;
-            try {
-                const key = await Crypto.deriveKey(pw, new Uint8Array(salt)),
-                    ok = await Crypto.checkVerification(key, verIv, verBlob);
-                if (!ok) {
-                    errEl.textContent = 'Incorrect password';
-                    btnOk.disabled = false;
-                    return;
-                }
-                // Decrypt file manifest from meta/2 (iv) + meta/3 (blob)
-                const mIv = Array.from(zipEntries['meta/2']),
-                    mBlob = buf2b64(zipEntries['meta/3']);
-                const decBuf = await Crypto.decrypt(key, mIv, mBlob);
-                const manifest = JSON.parse(new TextDecoder().decode(decBuf));
-                cleanup();
-                resolve(manifest);
-            } catch (e) {
-                errEl.textContent = 'Decryption failed: ' + e.message;
-                btnOk.disabled = false;
-            }
-        };
-
-        btnOk.onclick = doImport;
-        btnCancel.onclick = () => { cleanup(); resolve(null); };
-        btnClose.onclick = () => { cleanup(); resolve(null); };
-        pwInput.onkeydown = e => { if (e.key === 'Enter') doImport(); };
-    });
 }
 
 /* ============================================================

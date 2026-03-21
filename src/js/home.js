@@ -82,7 +82,7 @@ const Home = {
     _makeCard(c) {
         const pct = Math.min((c.totalSize || 0) / CONTAINER_LIMIT * 100, 100),
             fill = pct > 90 ? 'danger' : pct > 70 ? 'warn' : '',
-            hasSess = !!(sessionStorage.getItem('twc-s-' + c.id) || localStorage.getItem('twc-s-' + c.id)),
+            hasSess = hasSession(c.id),
             card = document.createElement('div');
         card.className = 'container-card';
         card.dataset.id = c.id;
@@ -170,9 +170,9 @@ const Home = {
             _saveCardOrder(newOrder);
         });
 
-        card.addEventListener('click', e => {
+        card.addEventListener('click', async e => {
             if (e.target.closest('.container-card-menu') || e.target.closest('.container-drag-handle')) return;
-            const savedPw = sessionStorage.getItem('twc-s-' + c.id) || localStorage.getItem('twc-s-' + c.id);
+            const savedPw = await loadSession(c.id);
             if (savedPw) {
                 _resumeSession(c, savedPw);
             } else {
@@ -189,14 +189,14 @@ const Home = {
 
 /* ---- Container context menu ---- */
 function showContainerMenu(e, c) {
-    const hasSess = !!(sessionStorage.getItem('twc-s-' + c.id) || localStorage.getItem('twc-s-' + c.id)),
+    const hasSess = hasSession(c.id),
         isOpen = App.container && App.container.id === c.id,
         items = [];
 
     // Open — resume if session exists, otherwise go to unlock view
     items.push({
-        label: 'Open', icon: Icons.unlock, action: () => {
-            const savedPw = sessionStorage.getItem('twc-s-' + c.id) || localStorage.getItem('twc-s-' + c.id);
+        label: 'Open', icon: Icons.unlock, action: async () => {
+            const savedPw = await loadSession(c.id);
             if (savedPw) _resumeSession(c, savedPw); else openUnlockView(c);
         }
     });
@@ -231,8 +231,7 @@ function showContainerMenu(e, c) {
 
 /* ---- Kill Session ---- */
 function killSession(c) {
-    sessionStorage.removeItem('twc-s-' + c.id);
-    localStorage.removeItem('twc-s-' + c.id);
+    clearSession(c.id);
     toast(`Session for "${c.name}" terminated`, 'info');
     Home.render();
 }
@@ -320,8 +319,7 @@ async function doChangePassword() {
         await DB.saveContainer(c);
 
         // Clear any stored sessions (password changed)
-        sessionStorage.removeItem('twc-s-' + c.id);
-        localStorage.removeItem('twc-s-' + c.id);
+        clearSession(c.id);
 
         hideLoading();
         toast(`Password for "${c.name}" changed successfully`, 'success');
@@ -618,8 +616,8 @@ function openUnlockView(c) {
     document.getElementById('unlock-error').innerHTML = '';
     document.getElementById('unlock-spinner').classList.remove('show');
     // Pre-fill checkbox and scope based on saved session
-    const hasSessT = !!sessionStorage.getItem('twc-s-' + c.id),
-        hasSessW = !!localStorage.getItem('twc-s-' + c.id),
+    const hasSessT = !!sessionStorage.getItem('snv-s-' + c.id),
+        hasSessW = !!localStorage.getItem('snv-sb-' + c.id),
         remEl = document.getElementById('unlock-remember'),
         opts = document.getElementById('remember-opts'),
         tabEl = document.getElementById('remember-tab'),
@@ -721,17 +719,10 @@ async function doUnlock() {
         const remEl = document.getElementById('unlock-remember');
         if (remEl && remEl.checked) {
             const scope = document.querySelector('input[name="remember-scope"]:checked')?.value || 'tab';
-            if (scope === 'browser') {
-                try { localStorage.setItem('twc-s-' + c.id, pw); } catch (e) { }
-                sessionStorage.removeItem('twc-s-' + c.id);
-            } else {
-                try { sessionStorage.setItem('twc-s-' + c.id, pw); } catch (e) { }
-                localStorage.removeItem('twc-s-' + c.id);
-            }
+            try { await saveSession(c.id, pw, scope); } catch { /* non-critical */ }
         } else {
             // Checkbox unchecked — clear any previously saved session
-            sessionStorage.removeItem('twc-s-' + c.id);
-            localStorage.removeItem('twc-s-' + c.id);
+            clearSession(c.id);
         }
     } catch (e) {
         document.getElementById('unlock-error').innerHTML = '<svg width="14" height="14" viewBox="0 0 16 16" fill="none"><path d="M8 1.5a6.5 6.5 0 100 13 6.5 6.5 0 000-13zM7.25 5h1.5v4h-1.5V5zm0 5h1.5v1.5h-1.5V10z" fill="currentColor"/></svg> ' + escHtml(e.message);
@@ -757,8 +748,7 @@ async function deleteContainerConfirmed() {
     try {
         await DB.nukeContainer(c.id);
         // Also clear any remembered session for this container
-        try { sessionStorage.removeItem('twc-s-' + c.id); } catch (e) { }
-        try { localStorage.removeItem('twc-s-' + c.id); } catch (e) { }
+        clearSession(c.id);
         hideLoading();
         await Home.render();
         toast(`Container \"${c.name}\" deleted`, 'info');
