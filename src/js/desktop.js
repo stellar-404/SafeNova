@@ -732,11 +732,14 @@ async function _runDbChecks(repair) {
         steps.push({ name, status, detail, issues: iss, fixed: fxd });
     }
 
-    let vfsFileIds = new Set(VFS.fileIds());
+    // Build the DB file map once (expensive IndexedDB call)
     const allDbFiles = await DB.getFilesByCid(App.container.id);
     const dbFileMap = new Map(allDbFiles.map(f => [f.id, f]));
 
-    // 1. File data existence — every VFS file node must have a matching DB record
+    // Snapshot VFS file IDs — refresh after each destructive step
+    let vfsFileIds = new Set(VFS.fileIds());
+
+    // 1. File data existence — VFS file nodes whose encrypted data is missing from IndexedDB
     {
         const issues = [], fixed = [];
         for (const id of vfsFileIds) {
@@ -745,50 +748,75 @@ async function _runDbChecks(repair) {
                 issues.push({ sev: 'critical', msg: `"${node?.name || id}": encrypted data not found in storage` });
                 if (repair) {
                     VFS.remove(id);
-                    vfsFileIds.delete(id);
                     fixed.push(`Removed broken file node "${node?.name || id}"`);
                 }
             }
         }
         mkStep('File data existence', issues, fixed);
+        if (repair && fixed.length) vfsFileIds = new Set(VFS.fileIds());
     }
 
-    // 2. Encryption IV integrity — files with missing/broken IVs cannot be decrypted
-    //    Repair: purge unrecoverable file from VFS and DB (data is lost)
+    // 2. Encryption IV integrity — attempt to coerce IV before declaring unrecoverable
     {
         const issues = [], fixed = [];
         for (const [id, rec] of dbFileMap) {
             if (!vfsFileIds.has(id)) continue;
             const node = VFS.node(id);
-            const broken = !rec.iv || !(rec.iv instanceof Uint8Array || rec.iv instanceof ArrayBuffer || ArrayBuffer.isView(rec.iv));
-            if (broken) {
-                issues.push({ sev: 'critical', msg: `"${node?.name || id}": ${!rec.iv ? 'missing' : 'invalid'} encryption IV` });
+
+            if (!rec.iv) {
+                issues.push({ sev: 'critical', msg: `"${node?.name || id}": missing encryption IV` });
                 if (repair) {
                     VFS.remove(id);
-                    vfsFileIds.delete(id);
+                    await DB.deleteFile(id);
+                    fixed.push(`Purged unrecoverable file "${node?.name || id}"`);
+                }
+                continue;
+            }
+
+            // Try to coerce IV into a valid Uint8Array (handles Array, base64 string, etc.)
+            let ivOk = rec.iv instanceof Uint8Array || rec.iv instanceof ArrayBuffer || ArrayBuffer.isView(rec.iv);
+            if (!ivOk && repair) {
+                let coerced = null;
+                if (Array.isArray(rec.iv)) {
+                    coerced = new Uint8Array(rec.iv);
+                } else if (typeof rec.iv === 'string') {
+                    try { coerced = new Uint8Array(atob(rec.iv).split('').map(c => c.charCodeAt(0))); } catch {}
+                }
+                if (coerced && coerced.length >= 12) {
+                    rec.iv = coerced;
+                    await DB.saveFile(rec);
+                    fixed.push(`Coerced IV for "${node?.name || id}" (${typeof rec.iv === 'string' ? 'base64' : 'array'} → Uint8Array)`);
+                    ivOk = true;
+                }
+            }
+
+            if (!ivOk) {
+                issues.push({ sev: 'critical', msg: `"${node?.name || id}": invalid encryption IV format` });
+                if (repair) {
+                    VFS.remove(id);
                     await DB.deleteFile(id);
                     fixed.push(`Purged unrecoverable file "${node?.name || id}"`);
                 }
             }
         }
         mkStep('Encryption IV integrity', issues, fixed);
+        if (repair && fixed.length) vfsFileIds = new Set(VFS.fileIds());
     }
 
     // 3. File blob integrity — sized files must have non-empty blob
-    //    Repair: remove the file node + DB record (cannot serve empty data)
     {
         const issues = [], fixed = [];
         for (const [id, rec] of dbFileMap) {
             if (!vfsFileIds.has(id)) continue;
             const node = VFS.node(id);
             if (!node) continue;
-            if (node.size > 0 && (!rec.blob || (rec.blob instanceof ArrayBuffer && rec.blob.byteLength === 0))) {
+            const blobLen = rec.blob ? (rec.blob.byteLength ?? rec.blob.length ?? 0) : 0;
+            if (node.size > 0 && blobLen === 0) {
                 issues.push({ sev: 'warn', msg: `"${node.name || id}": expected ${node.size} bytes but blob is empty` });
                 if (repair) {
-                    VFS.remove(id);
-                    vfsFileIds.delete(id);
-                    await DB.deleteFile(id);
-                    fixed.push(`Purged empty-blob file "${node.name || id}"`);
+                    // Zero the declared size instead of deleting the file — preserves metadata
+                    node.size = 0;
+                    fixed.push(`Reset size to 0 for "${node.name || id}"`);
                 }
             }
         }
@@ -811,18 +839,23 @@ async function _runDbChecks(repair) {
         mkStep('Orphaned storage records', issues, fixed);
     }
 
-    // 5. Dead folder cleanup — remove folders whose subtree has no recoverable files
+    // 5. Dead folder cleanup — prune folders whose entire subtree has zero live files
     {
         const issues = [], fixed = [];
         const liveIds = new Set(VFS.fileIds());
-        function hasLiveFile(fid) {
+        // Only clean dead folders if the user intentionally created them empty — skip if ALL folders are dead
+        // (that would mean the entire container is corrupted and we shouldn't wipe everything)
+        const totalFolders = Object.keys(VFS.toObj().nodes).filter(id => id !== 'root' && VFS.node(id)?.type === 'folder').length;
+
+        function hasLiveDescendant(fid, visited) {
+            if (visited.has(fid)) return false;
+            visited.add(fid);
             for (const child of VFS.children(fid)) {
                 if (child.type === 'file' && liveIds.has(child.id)) return true;
-                if (child.type === 'folder' && hasLiveFile(child.id)) return true;
+                if (child.type === 'folder' && hasLiveDescendant(child.id, visited)) return true;
             }
             return false;
         }
-        // Gather all non-root folders bottom-up (deepest first → safe to remove)
         function gatherBottomUp(fid) {
             const out = [];
             for (const child of VFS.children(fid)) {
@@ -831,12 +864,19 @@ async function _runDbChecks(repair) {
             return out;
         }
         const allFolders = gatherBottomUp('root');
+        let deadCount = 0;
         for (const fid of allFolders) {
             if (!VFS.node(fid)) continue;
-            if (!hasLiveFile(fid)) {
+            if (!hasLiveDescendant(fid, new Set())) deadCount++;
+        }
+        // Only prune if less than 90% of folders are dead (avoid nuking everything)
+        const shouldPrune = totalFolders > 0 && (deadCount / totalFolders < 0.9);
+        for (const fid of allFolders) {
+            if (!VFS.node(fid)) continue;
+            if (!hasLiveDescendant(fid, new Set())) {
                 const node = VFS.node(fid);
-                issues.push({ sev: 'warn', msg: `"${node?.name || fid}": no recoverable files in subtree` });
-                if (repair) { VFS.remove(fid); fixed.push(`Removed dead folder "${node?.name || fid}"`); }
+                issues.push({ sev: 'warn', msg: `"${node?.name || fid}": empty subtree` });
+                if (repair && shouldPrune) { VFS.remove(fid); fixed.push(`Removed dead folder "${node?.name || fid}"`); }
             }
         }
         mkStep('Dead folder cleanup', issues, fixed);
@@ -886,13 +926,19 @@ function _openScannerModal() {
         repairBtn.style.display = 'none';
         _runScanAnimated(false);
     };
-    repairBtn.onclick = async () => {
-        repairBtn.style.display = 'none';
-        startBtn.style.display = 'none';
-        log.innerHTML = '';
-        summary.style.display = 'none';
-        await _runScanAnimated(true);
+
+    repairBtn.onclick = () => {
+        // Show confirmation dialog over scanner
+        _showRepairConfirm().then(proceed => {
+            if (!proceed) return;
+            repairBtn.style.display = 'none';
+            startBtn.style.display = 'none';
+            log.innerHTML = '';
+            summary.style.display = 'none';
+            _runScanAnimated(true);
+        });
     };
+
     closeBtn.onclick = () => Overlay.hide();
 
     async function _runScanAnimated(repair) {
@@ -900,16 +946,16 @@ function _openScannerModal() {
         summary.style.display = 'none';
         _hasIssues = false;
 
-        // Phase 1: VFS structural checks (synchronous)
+        // Phase 1: VFS structural checks — run synchronously but yield per step for UI
         const vfsSteps = VFS.check(repair);
         for (const s of vfsSteps) {
             const row = _addScanRow(log, s.name);
-            await _delay(60 + Math.random() * 40);
+            await _delay(40 + Math.random() * 30);
             _resolveScanRow(row, s.status, s.detail);
             log.scrollTop = log.scrollHeight;
         }
 
-        // Phase 2: DB async checks (file data, IVs, orphans, size)
+        // Phase 2: DB async checks
         const dbCheckNames = [
             'File data existence',
             'Encryption IV integrity',
@@ -918,13 +964,12 @@ function _openScannerModal() {
             'Dead folder cleanup',
             'Container size consistency',
         ];
-        // Show spinning rows for all DB checks first
         const dbRows = dbCheckNames.map(name => _addScanRow(log, name));
         log.scrollTop = log.scrollHeight;
 
         const dbSteps = await _runDbChecks(repair);
         for (let i = 0; i < dbSteps.length; i++) {
-            await _delay(80 + Math.random() * 60);
+            await _delay(60 + Math.random() * 40);
             _resolveScanRow(dbRows[i], dbSteps[i].status, dbSteps[i].detail);
             log.scrollTop = log.scrollHeight;
         }
@@ -942,6 +987,11 @@ function _openScannerModal() {
                 <span class="scanner-summary-text"><strong>Repair complete.</strong> ${totalFixed} issue${totalFixed !== 1 ? 's' : ''} automatically resolved. Container integrity restored.</span>`;
             await saveVFS();
             Desktop.render();
+        } else if (repair && totalFixed === 0 && totalIssues > 0) {
+            // Repair ran but couldn't fix the remaining issues
+            summary.className = 'scanner-summary issues';
+            summary.innerHTML = `<svg width="20" height="20" viewBox="0 0 20 20" fill="none"><circle cx="10" cy="10" r="8.5" stroke="currentColor" stroke-width="1.4"/><path d="M10 5.5v5.5" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"/><circle cx="10" cy="14" r="0.9" fill="currentColor"/></svg>
+                <span class="scanner-summary-text"><strong>${totalIssues} issue${totalIssues !== 1 ? 's' : ''} could not be resolved.</strong> These issues require manual intervention or the data is unrecoverable.</span>`;
         } else if (allPass) {
             summary.className = 'scanner-summary healthy';
             summary.innerHTML = `<svg width="20" height="20" viewBox="0 0 24 26" fill="none"><path d="M12 3L3.5 7.5v4.5c0 5.2 3.6 10 8.5 11.5 4.9-1.5 8.5-6.3 8.5-11.5V7.5L12 3z" stroke="currentColor" stroke-width="1.5" fill="none"/><path d="M9 13l2.5 2.5 4-4.5" stroke="currentColor" stroke-width="1.6" stroke-linecap="square" stroke-linejoin="round"/></svg>
@@ -956,10 +1006,37 @@ function _openScannerModal() {
 
         startBtn.style.display = '';
         startBtn.disabled = false;
-        startBtn.textContent = _hasIssues ? 'Done' : 'Done';
+        startBtn.textContent = 'Done';
     }
 
     Overlay.show('modal-scanner');
+}
+
+/* ── Repair confirmation dialog (shown above scanner overlay) ─────── */
+function _showRepairConfirm() {
+    return new Promise(resolve => {
+        const ov = document.getElementById('repair-confirm-overlay'),
+            exportBtn = document.getElementById('repair-confirm-export'),
+            proceedBtn = document.getElementById('repair-confirm-proceed'),
+            cancelBtn = document.getElementById('repair-confirm-cancel');
+
+        function close(val) {
+            ov.classList.remove('show');
+            exportBtn.onclick = proceedBtn.onclick = cancelBtn.onclick = null;
+            resolve(val);
+        }
+
+        cancelBtn.onclick = () => close(false);
+        proceedBtn.onclick = () => close(true);
+        exportBtn.onclick = async () => {
+            // Export container via existing exportContainerFile
+            if (typeof exportContainerFile === 'function') {
+                await exportContainerFile(App.container, false);
+            }
+        };
+
+        ov.classList.add('show');
+    });
 }
 
 

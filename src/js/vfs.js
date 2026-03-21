@@ -354,40 +354,57 @@ const VFS = (() => {
             }
         });
 
-        // 8. Cycle detection
+        // 8. Cycle detection + 9. Reachability (combined O(n) with memoization)
+        //    Each node is visited at most twice (once for cycle check, once for reachability cache)
         step('Parent-child cycle detection', (log, fix) => {
+            // Phase A: detect and break cycles
+            const visiting = new Set(), safe = new Set(['root']);
             for (const id of allIds) {
-                if (id === 'root') continue;
-                const chain = new Set();
+                if (id === 'root' || safe.has(id)) continue;
+                const path = [];
                 let cur = id;
-                while (cur && cur !== 'root') {
-                    if (chain.has(cur)) {
+                while (cur && cur !== 'root' && !safe.has(cur)) {
+                    if (visiting.has(cur)) {
+                        // Cycle found — break at this node
                         log('critical', `Cycle at "${_nodes[cur]?.name || cur}"`);
                         if (repair) { _nodes[cur].parentId = 'root'; fix(`Broke cycle: reattached "${_nodes[cur]?.name || cur}" to root`); }
                         break;
                     }
+                    visiting.add(cur);
+                    path.push(cur);
                     if (!_nodes[cur]) break;
-                    chain.add(cur);
                     cur = _nodes[cur].parentId;
                 }
+                // Mark entire path as safe (regardless of how the chain ended)
+                for (const p of path) { safe.add(p); visiting.delete(p); }
             }
         });
 
-        // 9. Reachability — every non-root node must reach root
         step('Node reachability analysis', (log, fix) => {
-            for (const id of allIds) {
-                if (id === 'root') continue;
-                const visited = new Set();
-                let cur = id, reachable = false;
-                while (cur) {
-                    if (cur === 'root') { reachable = true; break; }
-                    if (visited.has(cur)) break;
-                    visited.add(cur);
+            // Phase B: check reachability with cache (O(n) amortized)
+            const reachCache = new Map(); // id → boolean
+            reachCache.set('root', true);
+            function isReachable(nid) {
+                if (reachCache.has(nid)) return reachCache.get(nid);
+                const chain = [];
+                let cur = nid;
+                while (cur && !reachCache.has(cur)) {
+                    chain.push(cur);
                     cur = _nodes[cur]?.parentId;
                 }
-                if (!reachable) {
+                const result = cur ? (reachCache.get(cur) || false) : false;
+                for (const c of chain) reachCache.set(c, result);
+                return result;
+            }
+            for (const id of allIds) {
+                if (id === 'root') continue;
+                if (!isReachable(id)) {
                     log('warn', `"${_nodes[id]?.name || id}" is unreachable from root`);
-                    if (repair) { _nodes[id].parentId = 'root'; fix(`Reattached unreachable "${_nodes[id]?.name || id}" to root`); }
+                    if (repair) {
+                        _nodes[id].parentId = 'root';
+                        reachCache.set(id, true);
+                        fix(`Reattached unreachable "${_nodes[id]?.name || id}" to root`);
+                    }
                 }
             }
         });
@@ -441,17 +458,15 @@ const VFS = (() => {
 
         // 12. File MIME type check
         step('File metadata validation', (log, fix) => {
+            const allowed = new Set(['id', 'name', 'type', 'parentId', 'ctime', 'mtime', 'size', 'mime', 'color']);
             for (const id of allIds) {
                 const n = _nodes[id];
                 if (n.type === 'file') {
-                    // Ensure mime is a string if present
                     if (n.mime !== undefined && typeof n.mime !== 'string') {
                         log('warn', `"${n.name || id}": invalid mime type`);
                         if (repair) { delete n.mime; fix(`Removed invalid mime for "${n.name || id}"`); }
                     }
                 }
-                // Check for unexpected extra properties
-                const allowed = new Set(['id', 'name', 'type', 'parentId', 'ctime', 'mtime', 'size', 'mime', 'color']);
                 for (const key of Object.keys(n)) {
                     if (!allowed.has(key)) {
                         log('warn', `"${n.name || id}": unexpected property "${key}"`);
