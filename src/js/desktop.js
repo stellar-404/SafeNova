@@ -1246,6 +1246,32 @@ function _snapFreeCell(rawX, rawY, occupied) {
 }
 
 /* ============================================================
+   THUMBNAIL QUEUE  —  limits concurrent generateThumb calls to avoid memory spikes
+   ============================================================ */
+const _thumbQueue = [];
+let _thumbActive = 0;
+const THUMB_MAX_CONCURRENT = 8;
+
+function _enqueueThumb(node) {
+    _thumbQueue.push(node);
+    _drainThumbQueue();
+}
+function _drainThumbQueue() {
+    while (_thumbActive < THUMB_MAX_CONCURRENT && _thumbQueue.length > 0) {
+        const n = _thumbQueue.shift();
+        _thumbActive++;
+        generateThumb(n).then(url => {
+            _thumbActive--;
+            _drainThumbQueue();
+            if (!url) return;
+            App.thumbCache[n.id] = url;
+            const el = document.querySelector(`.file-item[data-id="${n.id}"] .file-thumb`);
+            if (el) { const i = document.createElement('img'); i.src = url; i.draggable = false; el.innerHTML = ''; el.appendChild(i); }
+        });
+    }
+}
+
+/* ============================================================
    SHARED ICON ELEMENT BUILDER
    ============================================================ */
 function _buildIconEl(node, pos) {
@@ -1254,10 +1280,6 @@ function _buildIconEl(node, pos) {
     div.dataset.id = node.id;
     div.style.left = pos.x + 'px';
     div.style.top = pos.y + 'px';
-    // Prevent native browser drag-select ghost image
-    div.addEventListener('dragstart', e => e.preventDefault());
-    div.addEventListener('mouseenter', () => _startHoverTooltip(div, node));
-    div.addEventListener('mouseleave', _cancelHoverTooltip);
 
     const thumb = document.createElement('div');
     if (node.type === 'folder') {
@@ -1273,19 +1295,7 @@ function _buildIconEl(node, pos) {
             thumb.appendChild(img);
         } else {
             thumb.innerHTML = getFileIconSVG(mime, node.name);
-            if (isImage(mime)) {
-                generateThumb(node).then(url => {
-                    if (!url) return;
-                    App.thumbCache[node.id] = url;
-                    // Find in any visible context (main desktop or any window)
-                    const el = document.querySelector(`.file-item[data-id="${node.id}"] .file-thumb`);
-                    if (el) {
-                        const i = document.createElement('img');
-                        i.src = url; i.draggable = false;
-                        el.innerHTML = ''; el.appendChild(i);
-                    }
-                });
-            }
+            if (isImage(mime)) _enqueueThumb(node);
         }
     }
 
@@ -1298,27 +1308,87 @@ function _buildIconEl(node, pos) {
 }
 
 /* ============================================================
-   SHARED ICON INTERACTION HELPERS
-   owner implements: _onIconMousedown(e,div,node), _openNode(node), _contextIcon(e,node)
+   AREA-LEVEL EVENT DELEGATION FOR ICONS
+   Replaces per-element listeners — one set of listeners per container,
+   covering all .file-item[data-id] children regardless of count.
+   owner must implement: _onIconMousedown(e,el,node), _openNode(node), _contextIcon(e,node)
    ============================================================ */
-function _attachIconListeners(div, node, owner) {
-    div.addEventListener('mousedown', e => owner._onIconMousedown(e, div, node));
-    div.addEventListener('dblclick', e => { e.stopPropagation(); owner._openNode(node); });
-    let _isTouchEvent = false;
-    div.addEventListener('contextmenu', e => { e.preventDefault(); if (_touchDragActive || _isTouchEvent) return; e.stopPropagation(); owner._contextIcon(e, node); });
-    // Mobile: single tap → context menu, double tap → open
-    let _ts = 0, _tm = false, _lastTap = 0;
-    div.addEventListener('touchstart', () => { _ts = Date.now(); _tm = false; _isTouchEvent = true; _cancelHoverTooltip(); }, { passive: true });
-    div.addEventListener('touchmove', () => { _tm = true; }, { passive: true });
-    div.addEventListener('touchend', e => {
-        setTimeout(() => { _isTouchEvent = false; }, 500);
-        if (_tm || Date.now() - _ts > 350) return;
-        e.preventDefault();
-        const now = Date.now(), t = e.changedTouches[0];
-        if (now - _lastTap < 300) { _lastTap = 0; owner._openNode(node); }
-        else { _lastTap = now; owner._contextIcon({ clientX: t.clientX, clientY: t.clientY, ctrlKey: false, metaKey: false, preventDefault() { }, stopPropagation() { } }, node); }
+function _setupAreaDelegation(area, owner) {
+    // Prevent native drag ghost on icons
+    area.addEventListener('dragstart', e => {
+        if (e.target.closest('.file-item[data-id]')) e.preventDefault();
     });
-    div.addEventListener('touchcancel', () => { _isTouchEvent = false; }, { passive: true });
+    // Hover tooltips via mouseover/mouseout (simulate mouseenter/mouseleave per icon)
+    area.addEventListener('mouseover', e => {
+        const el = e.target.closest('.file-item[data-id]');
+        if (!el) return;
+        if (e.relatedTarget?.closest('.file-item[data-id]') !== el) {
+            const node = VFS.node(el.dataset.id);
+            if (node) _startHoverTooltip(el, node);
+        }
+    });
+    area.addEventListener('mouseout', e => {
+        const el = e.target.closest('.file-item[data-id]');
+        if (!el) return;
+        if (e.relatedTarget?.closest('.file-item[data-id]') !== el) _cancelHoverTooltip();
+    });
+    // Mousedown on icons
+    area.addEventListener('mousedown', e => {
+        const el = e.target.closest('.file-item[data-id]');
+        if (!el) return;
+        const node = VFS.node(el.dataset.id);
+        if (node) owner._onIconMousedown(e, el, node);
+    });
+    // Double-click → open
+    area.addEventListener('dblclick', e => {
+        const el = e.target.closest('.file-item[data-id]');
+        if (!el) return;
+        e.stopPropagation();
+        const node = VFS.node(el.dataset.id);
+        if (node) owner._openNode(node);
+    });
+    // Context menu on icons
+    area.addEventListener('contextmenu', e => {
+        const el = e.target.closest('.file-item[data-id]');
+        if (!el) return;
+        e.preventDefault();
+        if (_touchDragActive || el._tsIsTouch) return;
+        e.stopPropagation();
+        const node = VFS.node(el.dataset.id);
+        if (node) owner._contextIcon(e, node);
+    });
+    // Touch: state stored on element to avoid per-icon closure overhead
+    area.addEventListener('touchstart', e => {
+        const el = e.target.closest('.file-item[data-id]');
+        if (!el) return;
+        el._tsTime = Date.now(); el._tsMoved = false; el._tsIsTouch = true;
+        _cancelHoverTooltip();
+    }, { passive: true });
+    area.addEventListener('touchmove', e => {
+        const el = e.target.closest('.file-item[data-id]');
+        if (el) el._tsMoved = true;
+    }, { passive: true });
+    area.addEventListener('touchend', e => {
+        const el = e.target.closest('.file-item[data-id]');
+        if (!el) return;
+        setTimeout(() => { el._tsIsTouch = false; }, 500);
+        if (el._tsMoved || Date.now() - (el._tsTime || 0) > 350) return;
+        e.preventDefault();
+        const now = Date.now(), t = e.changedTouches[0],
+            node = VFS.node(el.dataset.id);
+        if (!node) return;
+        if (now - (el._tsLastTap || 0) < 300) {
+            el._tsLastTap = 0;
+            owner._openNode(node);
+        } else {
+            el._tsLastTap = now;
+            owner._contextIcon({ clientX: t.clientX, clientY: t.clientY, ctrlKey: false, metaKey: false, preventDefault() { }, stopPropagation() { } }, node);
+        }
+    });
+    area.addEventListener('touchcancel', e => {
+        const el = e.target.closest('.file-item[data-id]');
+        if (el) el._tsIsTouch = false;
+    }, { passive: true });
 }
 
 /* ---- Shared touch rubber-band selection on empty area + long-press context menu ----
@@ -1821,6 +1891,7 @@ function _startIconDrag(e, node, el, srcCtx) {
                 if (targetWinForFolder) targetWinForFolder.selection.add(id);
                 srcArea.querySelector(`:scope > .file-item[data-id="${id}"]`)?.remove();
                 if (!isDesktop) srcArea.querySelector(`.file-item[data-id="${id}"]`)?.remove();
+                srcArea._iconMap?.delete(id);
             });
             // snap back failures
             if (!isDesktop) srcCtx.selection.forEach(id => {
@@ -1857,6 +1928,7 @@ function _startIconDrag(e, node, el, srcCtx) {
                     const orig = srcArea.querySelector(`.file-item[data-id="${id}"]`);
                     if (orig) orig.remove();
                     if (isDesktop) srcArea.querySelector(`:scope > .file-item[data-id="${id}"]`)?.remove();
+                    srcArea._iconMap?.delete(id);
                 });
                 // snap back failures
                 if (!isDesktop) srcCtx.selection.forEach(id => {
@@ -1903,6 +1975,7 @@ function _startIconDrag(e, node, el, srcCtx) {
                 srcCtx.selection.delete(id);
                 Desktop._sel.add(id);
                 srcArea.querySelector(`.file-item[data-id="${id}"]`)?.remove();
+                srcArea._iconMap?.delete(id);
             });
             // snap back failures
             srcCtx.selection.forEach(id => {
@@ -2053,7 +2126,8 @@ function _buildIconMenuItems(node, sel, opts) {
 const Desktop = {
     _desktopFolder: 'root',
     _sel: App.selection,   // main desktop's own selection (same reference as App.selection initially)
-    // Unified interface aliases used by shared helpers (_attachIconListeners, _initAreaTouchRubberBand, _rubberBandSelect)
+    _renderToken: 0,       // cancels stale chunked renders on re-navigate
+    // Unified interface aliases used by shared helpers (_setupAreaDelegation, _initAreaTouchRubberBand, _rubberBandSelect)
     get selection() { return this._sel; },
     get folderId() { return this._desktopFolder; },
     _updateStatus() { this._updateSelectionBar(); },
@@ -2101,7 +2175,10 @@ const Desktop = {
 
     _renderIcons() {
         const area = document.getElementById('desktop-area');
-        area.querySelectorAll(':scope > .file-item').forEach(e => e.remove());
+        const iconMap = area._iconMap || (area._iconMap = new Map());
+        // Clear current icons
+        iconMap.forEach(el => el.remove());
+        iconMap.clear();
 
         const items = VFS.children(this._desktopFolder);
         items.sort((a, b) => {
@@ -2109,20 +2186,44 @@ const Desktop = {
             return a.name.localeCompare(b.name);
         });
 
-        items.forEach((node, idx) => {
-            let pos = VFS.getPos(this._desktopFolder, node.id);
-            if (!pos) {
-                pos = VFS.autoPos(this._desktopFolder, idx, area);
-                VFS.setPos(this._desktopFolder, node.id, pos.x, pos.y);
-            }
-            const div = _buildIconEl(node, pos);
-            if (this._sel.has(node.id)) div.classList.add('selected');
-            // pop-in animation with stagger
-            div.style.animation = `iconPop 0.12s ease ${Math.min(idx * 15, 200)}ms both`;
-            _attachIconListeners(div, node, this);
-            area.appendChild(div);
-        });
+        if (!items.length) {
+            this._updateSelectionBar();
+            if (typeof _applyCutStyles !== 'undefined') _applyCutStyles();
+            return;
+        }
 
+        // Batch-assign positions for items that have none (one occupied-set build)
+        const needPos = items.filter(n => !VFS.getPos(this._desktopFolder, n.id));
+        if (needPos.length) VFS.autoPosBatch(this._desktopFolder, needPos, area);
+
+        // Chunks: first 300 items render immediately; rest via rAF to keep UI responsive
+        const pid = this._desktopFolder, sel = this._sel,
+            useAnim = items.length <= 200,
+            token = ++this._renderToken;
+
+        const renderChunk = (start) => {
+            if (this._renderToken !== token) return; // cancelled by re-render
+            const frag = document.createDocumentFragment(),
+                end = Math.min(start + 300, items.length);
+            for (let i = start; i < end; i++) {
+                const node = items[i],
+                    pos = VFS.getPos(pid, node.id) || { x: 8, y: 8 },
+                    div = _buildIconEl(node, pos);
+                if (sel.has(node.id)) div.classList.add('selected');
+                if (useAnim) div.style.animation = `iconPop 0.12s ease ${Math.min(i * 15, 200)}ms both`;
+                iconMap.set(node.id, div);
+                frag.appendChild(div);
+            }
+            area.appendChild(frag);
+            if (end < items.length) {
+                requestAnimationFrame(() => renderChunk(end));
+            } else {
+                this._updateSelectionBar();
+                if (typeof _applyCutStyles !== 'undefined') _applyCutStyles();
+            }
+        };
+
+        renderChunk(0);
         this._updateSelectionBar();
         if (typeof _applyCutStyles !== 'undefined') _applyCutStyles();
     },
@@ -2137,35 +2238,38 @@ const Desktop = {
             nodes = VFS.children(this._desktopFolder),
             nodeMap = new Map(nodes.map(n => [n.id, n]));
 
+        const iconMap = area._iconMap || (area._iconMap = new Map());
+
         // Remove elements for nodes no longer in this folder
-        area.querySelectorAll(':scope > .file-item').forEach(el => {
-            if (!nodeMap.has(el.dataset.id)) el.remove();
+        iconMap.forEach((el, id) => {
+            if (!nodeMap.has(id)) { el.remove(); iconMap.delete(id); }
         });
 
-        // Add new icons; sync names of existing ones (no re-animate existing)
-        nodes.forEach((node, idx) => {
-            let pos = VFS.getPos(this._desktopFolder, node.id);
-            if (!pos) {
-                pos = VFS.autoPos(this._desktopFolder, idx, area);
-                VFS.setPos(this._desktopFolder, node.id, pos.x, pos.y);
-            }
-            const existing = area.querySelector(`:scope > .file-item[data-id="${node.id}"]`);
+        // Batch-position items without a saved position
+        const needPos = nodes.filter(n => !VFS.getPos(this._desktopFolder, n.id));
+        if (needPos.length) VFS.autoPosBatch(this._desktopFolder, needPos, area);
+
+        // Add new icons; sync names/colors of existing ones (no re-animate existing)
+        for (const node of nodes) {
+            let existing = iconMap.get(node.id);
+            // Guard: stale iconMap entry (element removed from DOM without iconMap cleanup)
+            if (existing && !existing.isConnected) { iconMap.delete(node.id); existing = null; }
             if (existing) {
                 const nameEl = existing.querySelector('.file-name');
                 if (nameEl && nameEl.textContent !== node.name) nameEl.textContent = node.name;
-                // Update folder color if changed
                 if (node.type === 'folder') {
                     const thumbEl = existing.querySelector('.file-thumb.folder-icon');
                     if (thumbEl) thumbEl.innerHTML = getFolderSVG(node.color);
                 }
             } else {
-                const div = _buildIconEl(node, pos);
+                const pos = VFS.getPos(this._desktopFolder, node.id) || { x: 8, y: 8 },
+                    div = _buildIconEl(node, pos);
                 if (this._sel.has(node.id)) div.classList.add('selected');
                 div.style.animation = 'iconPop 0.12s ease both';
-                _attachIconListeners(div, node, this);
+                iconMap.set(node.id, div);
                 area.appendChild(div);
             }
-        });
+        }
 
         this._updateSelectionBar();
         if (typeof _applyCutStyles !== 'undefined') _applyCutStyles();
@@ -2333,7 +2437,11 @@ const Desktop = {
                 const moved = [];
                 this._sel.forEach(id => {
                     if (id === _tdHoverFolder) return;
-                    if (VFS.move(id, _tdHoverFolder) === 'ok') { moved.push(id); area.querySelector(`:scope > .file-item[data-id="${id}"]`)?.remove(); }
+                    if (VFS.move(id, _tdHoverFolder) === 'ok') {
+                        moved.push(id);
+                        area.querySelector(`:scope > .file-item[data-id="${id}"]`)?.remove();
+                        area._iconMap?.delete(id);
+                    }
                 });
                 if (moved.length) logActivity('move', `${moved.length} item${moved.length > 1 ? 's' : ''} → ${VFS.node(_tdHoverFolder)?.name || 'folder'}`, moved.length);
                 moved.forEach(id => this._sel.delete(id));
@@ -2456,6 +2564,8 @@ const Desktop = {
 
     initEvents() {
         const area = document.getElementById('desktop-area');
+        // Delegated icon events: mousedown, dblclick, contextmenu, touch tap
+        _setupAreaDelegation(area, this);
         // Mobile touch-drag for icons
         this._initTouchDrag(area);
 
@@ -2722,6 +2832,8 @@ class FolderWindow {
 
         // Content area events
         const area = el.querySelector('.fw-area');
+        // Delegated icon events: mousedown, dblclick, contextmenu, touch tap
+        _setupAreaDelegation(area, this);
         area.addEventListener('contextmenu', e => {
             if (e.target === area) { e.preventDefault(); e.stopPropagation(); this._contextDesktop(e); }
         });
@@ -2863,32 +2975,59 @@ class FolderWindow {
         });
 
         if (folderChanged) {
-            area.querySelectorAll('.file-item').forEach(e => e.remove());
-            items.forEach((n, idx) => {
-                let pos = VFS.getPos(this.folderId, n.id);
-                if (!pos) {
-                    pos = VFS.autoPos(this.folderId, idx, area);
-                    VFS.setPos(this.folderId, n.id, pos.x, pos.y);
+            const iconMap = area._iconMap || (area._iconMap = new Map());
+            iconMap.forEach(el => el.remove());
+            iconMap.clear();
+
+            // Batch-position unpositioned items
+            const needPos = items.filter(n => !VFS.getPos(this.folderId, n.id));
+            if (needPos.length) VFS.autoPosBatch(this.folderId, needPos, area);
+
+            const useAnim = items.length <= 200;
+            const token = (area._renderToken = (area._renderToken || 0) + 1);
+
+            const renderChunk = (start) => {
+                if (area._renderToken !== token) return;
+                const frag = document.createDocumentFragment(),
+                    end = Math.min(start + 300, items.length);
+                for (let i = start; i < end; i++) {
+                    const n = items[i],
+                        pos = VFS.getPos(this.folderId, n.id) || { x: 8, y: 8 },
+                        div = this._makeIcon(n, pos, useAnim ? i : -1);
+                    iconMap.set(n.id, div);
+                    frag.appendChild(div);
                 }
-                area.appendChild(this._makeIcon(n, pos, idx));
-            });
+                area.appendChild(frag);
+                if (end < items.length) {
+                    requestAnimationFrame(() => renderChunk(end));
+                } else {
+                    this._updateStatus();
+                    if (typeof _applyCutStyles !== 'undefined') _applyCutStyles();
+                }
+            };
+            renderChunk(0);
         } else {
-            const nodeMap = new Map(items.map(n => [n.id, n]));
-            // Animate out removed items, then add new ones
-            area.querySelectorAll('.file-item').forEach(el => {
-                if (!nodeMap.has(el.dataset.id)) {
-                    el.style.transition = 'opacity .1s, transform .1s';
-                    el.style.opacity = '0'; el.style.transform = 'scale(.85)';
-                    setTimeout(() => el.remove(), 110);
+            const iconMap = area._iconMap || (area._iconMap = new Map()),
+                nodeMap = new Map(items.map(n => [n.id, n]));
+            // Animate out removed items
+            iconMap.forEach((el, id) => {
+                if (!nodeMap.has(id)) {
+                    if (!el.isConnected) {
+                        iconMap.delete(id); // already detached — immediate cleanup
+                    } else {
+                        el.style.transition = 'opacity .1s, transform .1s';
+                        el.style.opacity = '0'; el.style.transform = 'scale(.85)';
+                        setTimeout(() => { el.remove(); iconMap.delete(id); }, 110);
+                    }
                 }
             });
-            items.forEach((n, idx) => {
-                let pos = VFS.getPos(this.folderId, n.id);
-                if (!pos) {
-                    pos = VFS.autoPos(this.folderId, idx, area);
-                    VFS.setPos(this.folderId, n.id, pos.x, pos.y);
-                }
-                const existing = area.querySelector(`.file-item[data-id="${n.id}"]`);
+            // Batch-position new items
+            const needPos = items.filter(n => !VFS.getPos(this.folderId, n.id));
+            if (needPos.length) VFS.autoPosBatch(this.folderId, needPos, area);
+
+            for (const [idx, n] of items.entries()) {
+                let existing = iconMap.get(n.id);
+                if (existing && !existing.isConnected) { iconMap.delete(n.id); existing = null; }
                 if (existing) {
                     const nameEl = existing.querySelector('.file-name');
                     if (nameEl && nameEl.textContent !== n.name) nameEl.textContent = n.name;
@@ -2897,9 +3036,12 @@ class FolderWindow {
                         if (thumbEl) thumbEl.innerHTML = getFolderSVG(n.color);
                     }
                 } else {
-                    area.appendChild(this._makeIcon(n, pos, idx));
+                    const pos = VFS.getPos(this.folderId, n.id) || { x: 8, y: 8 },
+                        div = this._makeIcon(n, pos, idx);
+                    iconMap.set(n.id, div);
+                    area.appendChild(div);
                 }
-            });
+            }
         }
 
         this._updateStatus();
@@ -2913,9 +3055,8 @@ class FolderWindow {
     _makeIcon(node, pos, idx = 0) {
         const div = _buildIconEl(node, pos);
         if (this.selection.has(node.id)) div.classList.add('selected');
-        div.style.animation = `iconPop 0.12s ease ${Math.min(idx * 15, 200)}ms both`;
-
-        _attachIconListeners(div, node, this);
+        // idx >= 0: animate with stagger; idx < 0: no animation (large batches)
+        if (idx >= 0) div.style.animation = `iconPop 0.12s ease ${Math.min(idx * 15, 200)}ms both`;
         return div;
     }
 

@@ -6,10 +6,24 @@
 const VFS = (() => {
     let _nodes = {};  // id → Node
     let _pos = {};  // parentId → { nodeId: {x, y} }
+    let _childIndex = {};  // parentId → Set<childId> — O(1) children lookup
+
+    function _rebuildChildIndex() {
+        _childIndex = {};
+        for (const id of Object.keys(_nodes)) {
+            if (id === 'root') continue;
+            const pid = _nodes[id].parentId;
+            if (pid != null) {
+                if (!_childIndex[pid]) _childIndex[pid] = new Set();
+                _childIndex[pid].add(id);
+            }
+        }
+    }
 
     function init() {
         _nodes = { root: { id: 'root', type: 'folder', name: '/', parentId: null, ctime: Date.now(), mtime: Date.now() } };
         _pos = { root: {} };
+        _childIndex = {};
     }
 
     function fromObj(obj) {
@@ -48,11 +62,19 @@ const VFS = (() => {
                 if (!_nodes[nid]) delete _pos[pid][nid];
             }
         }
+        // Rebuild O(1) children index after loading + all repairs
+        _rebuildChildIndex();
     }
 
     function toObj() { return { nodes: _nodes, pos: _pos }; }
 
-    function children(pid) { return Object.values(_nodes).filter(n => n.parentId === pid); }
+    function children(pid) {
+        const ids = _childIndex[pid];
+        if (!ids || ids.size === 0) return [];
+        const result = [];
+        for (const id of ids) { if (_nodes[id]) result.push(_nodes[id]); }
+        return result;
+    }
 
     function getPos(pid, nid) { return (_pos[pid] || {})[nid] || null; }
     function setPos(pid, nid, x, y) {
@@ -69,6 +91,11 @@ const VFS = (() => {
         if (!nd?.id || nd.id === 'root' || !['file', 'folder'].includes(nd.type)) return;
         _nodes[nd.id] = nd;
         if (!_pos[nd.id] && nd.type === 'folder') _pos[nd.id] = {};
+        // Maintain child index
+        if (nd.parentId != null) {
+            if (!_childIndex[nd.parentId]) _childIndex[nd.parentId] = new Set();
+            _childIndex[nd.parentId].add(nd.id);
+        }
     }
 
     function remove(id, _visited = new Set()) {
@@ -78,8 +105,10 @@ const VFS = (() => {
         if (n.type === 'folder') {
             children(id).forEach(c => remove(c.id, _visited));
             delete _pos[id];
+            delete _childIndex[id];
         }
         delPos(n.parentId, id);
+        if (_childIndex[n.parentId]) _childIndex[n.parentId].delete(id);
         delete _nodes[id];
     }
 
@@ -101,9 +130,14 @@ const VFS = (() => {
         }
         // prevent duplicate name in destination
         if (children(newParentId).some(s => s.id !== id && s.name.toLowerCase() === n.name.toLowerCase())) return 'duplicate';
+        const oldParentId = n.parentId;
         delPos(n.parentId, id);
         n.parentId = newParentId;
         n.mtime = Date.now();
+        // Update child indexes
+        if (_childIndex[oldParentId]) _childIndex[oldParentId].delete(id);
+        if (!_childIndex[newParentId]) _childIndex[newParentId] = new Set();
+        _childIndex[newParentId].add(id);
         return 'ok';
     }
 
@@ -702,6 +736,9 @@ const VFS = (() => {
         last.status = 'pass';
         last.detail = last.issues[0]?.msg || 'OK';
 
+        // After repair passes that mutate _nodes directly, rebuild child index
+        if (repair) _rebuildChildIndex();
+
         return steps;
     }
 
@@ -737,6 +774,7 @@ const VFS = (() => {
                 if (!keep.has(nid)) delete _pos[pid][nid];
             }
         }
+        _rebuildChildIndex();
         return removed;
     }
 
@@ -829,6 +867,7 @@ const VFS = (() => {
             }
         }
 
+        _rebuildChildIndex();
         return removed;
     }
 
@@ -852,9 +891,42 @@ const VFS = (() => {
         return fixed;
     }
 
+    // Batch auto-positioning: builds the occupied set ONCE and assigns positions to all items
+    // that need one. Stores positions in _pos[pid] and returns Map<nodeId, {x, y}>.
+    function autoPosBatch(pid, items, area) {
+        if (!items.length) return new Map();
+        if (!_pos[pid]) _pos[pid] = {};
+        const W = (area && area.clientWidth) || 800,
+            cols = Math.max(1, Math.floor((W - 16) / GRID_X));
+        // Build occupied set once from existing positions
+        const occupied = new Set();
+        for (const p of Object.values(_pos[pid])) {
+            occupied.add(`${Math.round((p.x - 8) / GRID_X)}_${Math.round((p.y - 8) / GRID_Y)}`);
+        }
+        const results = new Map();
+        let scanRow = 0, scanCol = 0;
+        outer: for (const n of items) {
+            for (let row = scanRow; row < 10000; row++) {
+                for (let col = (row === scanRow ? scanCol : 0); col < cols; col++) {
+                    if (!occupied.has(`${col}_${row}`)) {
+                        const pos = { x: 8 + col * GRID_X, y: 8 + row * GRID_Y };
+                        _pos[pid][n.id] = pos;
+                        occupied.add(`${col}_${row}`);
+                        results.set(n.id, pos);
+                        scanRow = row; scanCol = col + 1;
+                        if (scanCol >= cols) { scanCol = 0; scanRow = row + 1; }
+                        continue outer;
+                    }
+                }
+            }
+        }
+        return results;
+    }
+
     return {
         init, fromObj, toObj, children, node, add, remove, rename, move, wouldCycle,
-        getPos, setPos, delPos, totalSize, breadcrumb, fullPath, autoPos, hasChildNamed,
-        remapPositions, check, fileIds, purgeDeadBranches, flattenDeepContent, repairMetadata
+        getPos, setPos, delPos, totalSize, breadcrumb, fullPath, autoPos, autoPosBatch,
+        hasChildNamed, remapPositions, check, fileIds, purgeDeadBranches,
+        flattenDeepContent, repairMetadata
     };
 })();
