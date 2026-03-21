@@ -259,47 +259,47 @@ async function deleteSelected() {
     // Prevent deleting folders currently open in Explorer windows
     const blocked = _openFolderGuard(ids);
     if (blocked) {
-        toast(`“${VFS.node(blocked)?.name}” is open in Explorer — close the window first`, 'error');
+        toast(`"${VFS.node(blocked)?.name}" is open in Explorer — close the window first`, 'error');
         return;
     }
-}
 
-const names = ids.map(id => VFS.node(id)?.name || '').filter(Boolean);
-const msg = ids.length === 1
-    ? `Delete "${names[0]}"? This action cannot be undone.`
-    : `Delete ${ids.length} items? This action cannot be undone.`;
+    const names = ids.map(id => VFS.node(id)?.name || '').filter(Boolean);
+    const msg = ids.length === 1
+        ? `Delete "${names[0]}"? This action cannot be undone.`
+        : `Delete ${ids.length} items? This action cannot be undone.`;
 
-document.getElementById('delete-msg').textContent = msg;
-Overlay.show('modal-delete');
-document.getElementById('delete-ok').onclick = async () => {
-    Overlay.hide();
-    showLoading('Deleting...');
-    for (const id of ids) {
-        const n = VFS.node(id); if (!n) continue;
-        if (n.type === 'file') {
-            try { await DB.deleteFile(id); } catch (e) { }
-            delete App.thumbCache[id];
-        } else {
-            const toDelete = [];
-            const _walkSeen = new Set();
-            const walk = fid => {
-                if (_walkSeen.has(fid)) return;
-                _walkSeen.add(fid);
-                VFS.children(fid).forEach(c => { if (c.type === 'file') toDelete.push(c.id); else walk(c.id); });
-            };
-            walk(id);
-            for (const fid of toDelete) { try { await DB.deleteFile(fid); } catch (e) { } delete App.thumbCache[fid]; }
+    document.getElementById('delete-msg').textContent = msg;
+    Overlay.show('modal-delete');
+    document.getElementById('delete-ok').onclick = async () => {
+        Overlay.hide();
+        showLoading('Deleting...');
+        const allFileIds = [];
+        for (const id of ids) {
+            const n = VFS.node(id); if (!n) continue;
+            if (n.type === 'file') {
+                allFileIds.push(id);
+            } else {
+                const _walkSeen = new Set();
+                const walk = fid => {
+                    if (_walkSeen.has(fid)) return;
+                    _walkSeen.add(fid);
+                    VFS.children(fid).forEach(c => { if (c.type === 'file') allFileIds.push(c.id); else walk(c.id); });
+                };
+                walk(id);
+            }
         }
-        VFS.remove(id);
-    }
-    selRef.clear();
-    await saveVFS();
-    Desktop._patchIcons();
-    if (typeof WinManager !== 'undefined') WinManager.renderAll();
-    hideLoading();
-    toast('Deleted', 'info');
-    logActivity('delete', ids.length === 1 ? names[0] : `${ids.length} items`, ids.length);
-};
+        if (allFileIds.length) await DB.deleteFiles(allFileIds).catch(() => {});
+        allFileIds.forEach(fid => { delete App.thumbCache[fid]; });
+        for (const id of ids) VFS.remove(id);
+        selRef.clear();
+        await saveVFS();
+        Desktop._patchIcons();
+        if (typeof WinManager !== 'undefined') WinManager.renderAll();
+        hideLoading();
+        toast('Deleted', 'info');
+        logActivity('delete', ids.length === 1 ? names[0] : `${ids.length} items`, ids.length);
+    };
+}
 
 /* ============================================================
    NEW TEXT FILE  —  BUG FIX: just creates the file, does NOT open editor
@@ -1136,20 +1136,28 @@ async function exportAsZip(nodeIds, zipName) {
     }
     showLoading('Preparing ZIP…');
     try {
-        const entries = [], _zipSeen = new Set();
-        async function collectFiles(nodeId, prefix, _depth = 0) {
+        const entries = [], _zipSeen = new Set(), _flat = [];
+        function _collectFlat(nodeId, prefix, _depth = 0) {
             if (_zipSeen.has(nodeId) || _depth > 64) return;
             _zipSeen.add(nodeId);
             const n = VFS.node(nodeId); if (!n) return;
             if (n.type === 'folder') {
-                for (const c of VFS.children(nodeId)) await collectFiles(c.id, prefix + n.name + '/', _depth + 1);
+                for (const c of VFS.children(nodeId)) _collectFlat(c.id, prefix + n.name + '/', _depth + 1);
             } else {
-                const rec = await DB.getFile(nodeId); if (!rec) return;
-                const buf = await Crypto.decryptBin(App.key, rec.iv, rec.blob);
-                entries.push({ name: prefix + n.name, data: new Uint8Array(buf), mtime: n.mtime || n.ctime });
+                _flat.push({ id: nodeId, name: prefix + n.name, mtime: n.mtime || n.ctime });
             }
         }
-        for (const id of nodeIds) await collectFiles(id, '');
+        for (const id of nodeIds) _collectFlat(id, '');
+        const DBATCH = 4;
+        for (let i = 0; i < _flat.length; i += DBATCH) {
+            const batch = _flat.slice(i, i + DBATCH);
+            const results = await Promise.allSettled(batch.map(async item => {
+                const rec = await DB.getFile(item.id); if (!rec) return null;
+                const buf = await Crypto.decryptBin(App.key, rec.iv, rec.blob);
+                return { name: item.name, data: new Uint8Array(buf), mtime: item.mtime };
+            }));
+            results.forEach(r => { if (r.status === 'fulfilled' && r.value) entries.push(r.value); });
+        }
         if (!entries.length) { toast('Nothing to export', 'warn'); hideLoading(); return; }
         const zip = _buildZip(entries);
         downloadBuf(zip.buffer, zipName, 'application/zip');
@@ -1163,14 +1171,7 @@ async function exportAsZip(nodeIds, zipName) {
    CONTAINER IMPORT / EXPORT
    ============================================================ */
 
-// Safe base64 for large ArrayBuffers (avoids stack overflow from spread)
-function _buf2b64Safe(buf) {
-    const u8 = buf instanceof Uint8Array ? buf : new Uint8Array(buf);
-    let str = '', CHUNK = 8192;
-    for (let i = 0; i < u8.length; i += CHUNK)
-        str += String.fromCharCode(...u8.subarray(i, Math.min(i + CHUNK, u8.length)));
-    return btoa(str);
-}
+// _buf2b64Safe removed — buf2b64 is now chunked and equivalent
 
 /** Prompt for password to derive the container key before exporting a locked container */
 function _askExportPassword(c) {
@@ -1259,13 +1260,13 @@ async function exportContainerFile(c, requirePassword = true) {
             if (!key) return;
             showLoading('Exporting container…');
         }
-        const encManifest = await Crypto.encrypt(key, manifestJson),
+        const encManifest = await Crypto.encryptBin(key, new TextEncoder().encode(manifestJson)),
             encManifestIv = new Uint8Array(encManifest.iv),
-            encManifestBlob = new Uint8Array(b642buf(encManifest.blob));
+            encManifestBlob = new Uint8Array(encManifest.blob);
 
         // VFS bytes → meta/0 (iv raw), meta/1 (blob raw)
         const vfsIvData = vfsRec ? new Uint8Array(vfsRec.iv) : new Uint8Array(0),
-            vfsBlobData = vfsRec ? new Uint8Array(b642buf(vfsRec.blob)) : new Uint8Array(0);
+            vfsBlobData = vfsRec ? new Uint8Array(typeof vfsRec.blob === 'string' ? b642buf(vfsRec.blob) : vfsRec.blob) : new Uint8Array(0);
 
         // container.xml — file manifest is encrypted, no <files> in plaintext
         const saltB64 = btoa(String.fromCharCode(...new Uint8Array(c.salt))),
@@ -1392,7 +1393,7 @@ async function importContainerFile(file) {
                     cObj._alogZ = entries['meta/activity_log.zlib'];
                 }
                 await DB.saveContainer(cObj);
-                await DB.saveVFS(newCid, Array.from(entries['meta/0']), buf2b64(entries['meta/1']));
+                await DB.saveVFS(newCid, Array.from(entries['meta/0']), entries['meta/1'].buffer);
                 hideLoading();
                 toast(`Container "${name}" imported`, 'success');
                 await Home.render();
