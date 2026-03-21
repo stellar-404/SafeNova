@@ -1381,6 +1381,7 @@ textarea.code-editor::-webkit-scrollbar-thumb {
         left 0.05s linear,
         top 0.05s linear;
 }
+.no-snap-highlight .snap-preview { display: none !important; }
 
 /* File Viewer Modal */
 .modal-viewer {
@@ -1799,7 +1800,7 @@ textarea.code-editor::-webkit-scrollbar-thumb {
 
 /* Selection info bar */
 .selection-bar {
-    position: absolute;
+    position: fixed;
     bottom: 42px;
     left: 50%;
     transform: translateX(-50%);
@@ -2139,18 +2140,9 @@ input[type="password"]::-ms-clear {
 .ctx-item-key-hint {
     margin-left: auto;
     padding-left: 8px;
-    opacity: 0.72;
     display: flex;
     align-items: center;
     flex-shrink: 0;
-}
-.ctx-item-key-hint svg {
-    width: 13px;
-    height: 13px;
-}
-.ctx-item-key-hint svg circle,
-.ctx-item-key-hint svg path {
-    stroke-width: 2;
 }
 
 /* ============================================================
@@ -2453,6 +2445,169 @@ input[type="password"]::-ms-clear {
     text-shadow: 0 1px 2px rgba(0, 0, 0, 0.5);
 }
 
+/* ============================================================
+   ACTIVITY LOGS
+   ============================================================ */
+.alog-toolbar {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    padding: 10px 16px 8px;
+    border-bottom: 1px solid var(--border);
+}
+.alog-filters {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 4px;
+    flex: 1;
+    min-width: 0;
+}
+.alog-filter {
+    display: inline-flex;
+    align-items: center;
+    gap: 4px;
+    padding: 3px 8px;
+    border-radius: 3px;
+    font-size: 11px;
+    border: 1px solid var(--border2);
+    background: transparent;
+    color: var(--text-dim);
+    cursor: pointer;
+    transition: background .15s, border-color .15s, color .15s;
+    white-space: nowrap;
+}
+.alog-filter.active {
+    color: var(--text);
+    border-color: var(--accent);
+    background: color-mix(in srgb, var(--accent) 8%, transparent);
+}
+.alog-filter:hover { background: var(--bg3); }
+.alog-filter-count {
+    font-size: 10px;
+    opacity: .5;
+    font-weight: 600;
+}
+.alog-clear-btn {
+    display: inline-flex;
+    align-items: center;
+    gap: 4px;
+    padding: 4px 10px;
+    border: 1px solid var(--border2);
+    background: transparent;
+    color: var(--text-dim);
+    border-radius: var(--r);
+    font-size: 11px;
+    cursor: pointer;
+    white-space: nowrap;
+    flex-shrink: 0;
+    transition: color .15s, border-color .15s;
+}
+.alog-clear-btn:hover { color: var(--red, #e74856); border-color: var(--red, #e74856); }
+.alog-list {
+    height: 300px;
+    overflow-y: auto;
+}
+.alog-group {
+    padding: 6px 16px 4px;
+    font-size: 10px;
+    font-weight: 600;
+    text-transform: uppercase;
+    letter-spacing: 0.5px;
+    color: var(--text-dim);
+    background: var(--bg3);
+    border-bottom: 1px solid var(--border);
+    position: sticky;
+    top: 0;
+    z-index: 1;
+}
+.alog-item {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    padding: 7px 16px;
+    border-bottom: 1px solid var(--border);
+    font-size: 12.5px;
+}
+.alog-badge {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    min-width: 80px;
+    padding: 2px 8px;
+    border-radius: 3px;
+    font-size: 11px;
+    font-weight: 500;
+    white-space: nowrap;
+    flex-shrink: 0;
+    color: var(--bc);
+    background: color-mix(in srgb, var(--bc) 12%, transparent);
+    border: 1px solid color-mix(in srgb, var(--bc) 28%, transparent);
+}
+.alog-detail {
+    flex: 1;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    color: var(--text);
+}
+.alog-path {
+    color: var(--text-dim);
+    font-size: 11px;
+}
+.alog-time {
+    flex-shrink: 0;
+    font-size: 11px;
+    color: var(--text-dim);
+}
+.alog-off,
+.alog-empty {
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    justify-content: center;
+    height: 340px;
+    color: var(--text-dim);
+    gap: 12px;
+    padding: 0 24px;
+}
+.alog-off-text {
+    font-size: 13px;
+}
+
+/* ============================================================
+   SETTINGS SUB-OPTION ROW
+   ============================================================ */
+.settings-sub-row {
+    padding-left: 28px;
+    position: relative;
+}
+.settings-sub-indicator {
+    position: absolute;
+    left: 12px;
+    top: -6px;
+    width: 10px;
+    height: calc(50% + 4px);
+    border-left: 1.5px solid var(--border2);
+    border-bottom: 1.5px solid var(--border2);
+    border-radius: 0;
+}
+.settings-sub-row.disabled {
+    opacity: .35;
+    pointer-events: none;
+}
+
+/* ============================================================
+   AUTH DOT (red dot in context menu)
+   ============================================================ */
+.auth-dot {
+    width: 6px;
+    height: 6px;
+    border-radius: 50%;
+    background: #e74856;
+    display: inline-block;
+    flex-shrink: 0;
+}
+
 /* Burger button + dropdown: hidden by default (desktop) */
 .topbar-burger {
     display: none;
@@ -2639,13 +2794,13 @@ input[type="password"]::-ms-clear {
         font-size: 16px !important;
     }
 
-    /* Folder windows: full-screen on mobile */
+    /* Folder windows: full-screen on mobile, leave room for taskbar */
     .folder-window {
         position: fixed !important;
         left: 0 !important;
         top: 0 !important;
         width: 100vw !important;
-        height: 100dvh !important;
+        height: calc(100dvh - 37px) !important;
         min-width: unset !important;
         min-height: unset !important;
         border-radius: 0;

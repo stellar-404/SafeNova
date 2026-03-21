@@ -197,7 +197,7 @@ function showContainerMenu(e, c) {
     // Open — resume if session exists, otherwise go to unlock view
     items.push({
         label: 'Open', icon: Icons.unlock,
-        _keyHint: !hasSess ? Icons.key : null,
+        _keyHint: !hasSess ? '<span class="auth-dot"></span>' : null,
         action: async () => {
             const savedPw = await loadSession(c.id);
             if (savedPw) _resumeSession(c, savedPw); else openUnlockView(c);
@@ -213,7 +213,7 @@ function showContainerMenu(e, c) {
     const cpDisabled = hasSess || isOpen;
     items.push({
         label: 'Change Password…', icon: Icons.key,
-        _keyHint: !cpDisabled ? Icons.key : null,
+        _keyHint: !cpDisabled ? '<span class="auth-dot"></span>' : null,
         disabled: cpDisabled,
         _tooltip: cpDisabled ? 'End the active session first' : null,
         action: cpDisabled ? null : () => openChangePasswordModal(c)
@@ -230,7 +230,7 @@ function showContainerMenu(e, c) {
     items.push({ sep: true });
     items.push({
         label: 'Export Container', icon: Icons.download,
-        _keyHint: reqExpPw ? Icons.key : null,
+        _keyHint: reqExpPw ? '<span class="auth-dot"></span>' : null,
         action: () => exportContainerFile(c, reqExpPw)
     });
     items.push({ sep: true });

@@ -58,7 +58,10 @@ async function uploadFiles(files) {
     await saveVFS();
     Desktop._patchIcons();
     hideLoading();
-    if (ok > 0) toast(`${ok} file${ok > 1 ? 's' : ''} imported`, 'success');
+    if (ok > 0) {
+        toast(`${ok} file${ok > 1 ? 's' : ''} imported`, 'success');
+        logActivity('upload', ok === 1 ? files[0].name : `${ok} files`, ok);
+    }
 }
 
 /* ============================================================
@@ -162,7 +165,10 @@ async function uploadEntries(dataTransferItems, targetFolderId) {
     Desktop._patchIcons();
     if (typeof WinManager !== 'undefined') WinManager.renderAll();
     hideLoading();
-    if (ok > 0) toast(`${ok} item${ok !== 1 ? 's' : ''} imported`, 'success');
+    if (ok > 0) {
+        toast(`${ok} item${ok !== 1 ? 's' : ''} imported`, 'success');
+        logActivity('upload', `${ok} items`, ok);
+    }
 }
 
 /* ============================================================
@@ -203,6 +209,7 @@ async function downloadFile(node) {
         const buf = await Crypto.decryptBin(App.key, rec.iv, rec.blob);
         downloadBuf(buf, node.name, node.mime || getMime(node.name));
         toast('Exported: ' + node.name, 'success');
+        logActivity('download', node.name);
     } catch (e) { toast('Decryption failed: ' + e.message, 'error'); }
     hideLoading();
 }
@@ -223,6 +230,7 @@ function _confirmExport(node, buf, mime) {
         Overlay.hide();
         downloadBuf(buf, node.name, mime);
         toast('Exported: ' + node.name, 'success');
+        logActivity('download', node.name);
     };
 }
 
@@ -282,6 +290,7 @@ async function deleteSelected() {
         if (typeof WinManager !== 'undefined') WinManager.renderAll();
         hideLoading();
         toast('Deleted', 'info');
+        logActivity('delete', ids.length === 1 ? names[0] : `${ids.length} items`, ids.length);
     };
 }
 
@@ -346,6 +355,7 @@ async function createTextFile() {
     await saveVFS();
     if (winCtx) winCtx.render(); else Desktop._patchIcons();
     toast(`File “${name}” created`, 'success');
+    logActivity('create-file', name);
 }
 
 /* ============================================================
@@ -399,6 +409,7 @@ async function createFolder() {
     await saveVFS();
     if (winCtx) winCtx.render(); else Desktop._patchIcons();
     toast(`Folder "${name}" created`, 'success');
+    logActivity('create-folder', name);
 }
 
 /* ============================================================
@@ -438,9 +449,11 @@ function renameNode(node) {
             toast(`“${newName}” already exists in this folder`, 'error'); return;
         }
         Overlay.hide();
+        const _oldName = node.name;
         VFS.rename(node.id, newName);
         await saveVFS();
         if (capturedWinCtx) capturedWinCtx.render(); else Desktop._patchIcons();
+        logActivity('rename', `${_oldName} → ${newName}`);
     };
 }
 
@@ -450,6 +463,7 @@ function renameNode(node) {
 function copyItems() {
     App.clipboard = { op: 'copy', ids: [...App.selection] };
     toast(`${App.clipboard.ids.length} item(s) copied`, 'info');
+    logActivity('copy', `${App.clipboard.ids.length} items`, App.clipboard.ids.length);
 }
 function cutItems() {
     // Prevent cutting folders currently open in Explorer windows
@@ -471,6 +485,7 @@ function cutItems() {
 
     App.clipboard = { op: 'cut', ids: [...App.selection] };
     toast(`${App.clipboard.ids.length} item(s) cut`, 'info');
+    logActivity('cut', `${App.clipboard.ids.length} items`, App.clipboard.ids.length);
     _applyCutStyles();
 }
 
@@ -525,6 +540,8 @@ async function pasteItems() {
     // Refresh all open views so both source and target folders update
     Desktop._patchIcons();
     if (typeof WinManager !== 'undefined') WinManager.renderAll();
+    const _destName = VFS.node(App.folder)?.name || 'Desktop';
+    logActivity('paste', `${ids.length} items → ${_destName}`, ids.length);
 }
 
 async function deepCopy(nodeId, newParent, newName, _depth = 0) {
@@ -588,6 +605,7 @@ function sortIcons(by = 'name', dir = 'asc', winCtx = null) {
         }
     });
     saveVFS();
+    logActivity('sort', `by ${by} (${dir})`);
 }
 
 /* ============================================================
@@ -714,6 +732,32 @@ function openEditor(node, buf) {
         mod.style.display = ta.value !== _editorOriginal ? '' : 'none';
     };
     ta.oninput();
+    // Custom context menu for text editor (works on desktop + mobile)
+    ta.oncontextmenu = e => {
+        e.preventDefault();
+        const hasSel = ta.selectionStart !== ta.selectionEnd;
+        const _undoIcon = '<svg width="16" height="16" viewBox="0 0 16 16" fill="none"><path d="M3 6l-2 2 2 2" stroke="currentColor" stroke-width="1.4" stroke-linecap="square" stroke-linejoin="miter"/><path d="M1 8h9a4 4 0 000-8" stroke="currentColor" stroke-width="1.4"/></svg>';
+        const _redoIcon = '<svg width="16" height="16" viewBox="0 0 16 16" fill="none"><path d="M13 6l2 2-2 2" stroke="currentColor" stroke-width="1.4" stroke-linecap="square" stroke-linejoin="miter"/><path d="M15 8H6a4 4 0 010-8" stroke="currentColor" stroke-width="1.4"/></svg>';
+        const _selAllIcon = '<svg width="16" height="16" viewBox="0 0 16 16" fill="none"><rect x="2" y="2" width="12" height="12" rx="1" stroke="currentColor" stroke-width="1.4"/><path d="M5 8h6M5 5.5h6M5 10.5h4" stroke="currentColor" stroke-width="1.2" stroke-linecap="square"/></svg>';
+        showCtxMenu(e.clientX || e.pageX, e.clientY || e.pageY, [
+            { label: 'Undo', icon: _undoIcon, action: () => { ta.focus(); document.execCommand('undo'); if (ta.oninput) ta.oninput(); } },
+            { label: 'Redo', icon: _redoIcon, action: () => { ta.focus(); document.execCommand('redo'); if (ta.oninput) ta.oninput(); } },
+            { sep: true },
+            { label: 'Cut', icon: Icons.cut, action: () => { ta.focus(); document.execCommand('cut'); if (ta.oninput) ta.oninput(); }, disabled: !hasSel },
+            { label: 'Copy', icon: Icons.copy, action: () => { ta.focus(); document.execCommand('copy'); }, disabled: !hasSel },
+            { label: 'Paste', icon: Icons.paste, action: async () => {
+                ta.focus();
+                try {
+                    const txt = await navigator.clipboard.readText();
+                    const ss = ta.selectionStart, se = ta.selectionEnd;
+                    ta.setRangeText(txt, ss, se, 'end');
+                    if (ta.oninput) ta.oninput();
+                } catch (_) { /* clipboard read may be blocked by browser */ }
+            }},
+            { sep: true },
+            { label: 'Select All', icon: _selAllIcon, action: () => { ta.focus(); ta.select(); } }
+        ]);
+    };
     Overlay.show('modal-editor');
     setTimeout(() => ta.focus(), 100);
 }
@@ -743,6 +787,7 @@ async function saveEditor() {
         await saveVFS();
         Desktop._patchIcons();
         toast('File saved', 'success');
+        logActivity('edit', _editorNode.name);
         saved = true;
     } catch (e) { toast('Save failed: ' + e.message, 'error'); console.error(e); }
     hideLoading();
@@ -1121,6 +1166,7 @@ async function exportAsZip(nodeIds, zipName) {
         const zip = _buildZip(entries);
         downloadBuf(zip.buffer, zipName, 'application/zip');
         toast(`Exported ${entries.length} file${entries.length !== 1 ? 's' : ''} as ZIP`, 'success');
+        logActivity('export-zip', `${entries.length} files`, entries.length);
     } catch (e) { toast('ZIP export failed: ' + e.message, 'error'); console.error(e); }
     hideLoading();
 }
@@ -1236,6 +1282,7 @@ async function exportContainerFile(c, requirePassword = true) {
         // container.xml — file manifest is encrypted, no <files> in plaintext
         const saltB64 = btoa(String.fromCharCode(...new Uint8Array(c.salt))),
             verIvB64 = btoa(String.fromCharCode(...new Uint8Array(c.verIv)));
+        const settingsToExport = { ...SETTINGS_DEFAULTS, ...(c.settings || {}) };
         const xmlLines = [
             '<?xml version="1.0" encoding="UTF-8"?>',
             `<safenova version="3" exportedAt="${now}">`,
@@ -1247,6 +1294,9 @@ async function exportContainerFile(c, requirePassword = true) {
             `    <verBlob>${c.verBlob}</verBlob>`,
             `    <totalSize>${c.totalSize || 0}</totalSize>`,
             '  </container>',
+            '  <settings>',
+            ...Object.entries(settingsToExport).map(([k, v]) => `    <${k}>${_escXml(String(v))}</${k}>`),
+            '  </settings>',
             '  <files encrypted="true"/>',
             '</safenova>',
         ];
@@ -1260,10 +1310,20 @@ async function exportContainerFile(c, requirePassword = true) {
             { name: 'meta/3', data: encManifestBlob, mtime: now },
             { name: 'safenova_efs/workspace.bin', data: workspaceBin, mtime: now },
         ];
+        // Optionally include activity log (compressed)
+        if (c.settings?.exportWithLogs === true) {
+            const logData = (App.container?.id === c.id && typeof _activityLog !== 'undefined' && _activityLog.length)
+                ? await _compressLog(_activityLog)
+                : c._alogZ;
+            if (logData && (logData.byteLength || logData.length)) {
+                entries.push({ name: 'meta/activity_log.zlib', data: new Uint8Array(logData), mtime: now });
+            }
+        }
         const zip = _buildZip(entries);
         const dateStr = new Date(now).toISOString().slice(0, 10);
         downloadBuf(zip.buffer, `SafeNova_${c.name}_${dateStr}.safenova`, 'application/octet-stream');
         toast(`Container "${c.name}" exported`, 'success');
+        logActivity('export-container', c.name);
     } catch (e) { toast('Export failed: ' + e.message, 'error'); console.error(e); }
     hideLoading();
 }
@@ -1300,6 +1360,17 @@ async function importContainerFile(file) {
             if (!nameRaw || !saltB64 || !verIvB64 || !verBlob)
                 throw new Error('Invalid container.xml: missing required fields');
 
+            // Parse settings block if present
+            const settingsEl = doc.querySelector('settings');
+            let importedSettings;
+            if (settingsEl) {
+                importedSettings = {};
+                Array.from(settingsEl.children).forEach(el => {
+                    const v = el.textContent.trim();
+                    importedSettings[el.tagName] = v === 'true' ? true : v === 'false' ? false : v;
+                });
+            }
+
             const salt = Array.from(Uint8Array.from(atob(saltB64), ch => ch.charCodeAt(0))),
                 verIv = Array.from(Uint8Array.from(atob(verIvB64), ch => ch.charCodeAt(0)));
 
@@ -1313,6 +1384,7 @@ async function importContainerFile(file) {
                 const newCid = uid();
                 await DB.saveContainer({
                     id: newCid, name, createdAt, salt, verIv, verBlob, totalSize,
+                    settings: importedSettings || undefined,
                     lazyWorkspace: {
                         bin: entries['safenova_efs/workspace.bin'],
                         mIv: entries['meta/2'],

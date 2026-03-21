@@ -10,9 +10,225 @@ async function saveVFS() {
             { iv, blob } = await Crypto.encrypt(App.key, json);
         await DB.saveVFS(App.container.id, iv, blob);
         App.container.totalSize = VFS.totalSize();
+        // Strip raw log so only compressed _alogZ gets persisted
+        const _tmpLog = App.container.activityLog;
+        delete App.container.activityLog;
         await DB.saveContainer(App.container);
+        if (_tmpLog) App.container.activityLog = _tmpLog;
         Desktop.updateTaskbar();
     } catch (e) { console.error('saveVFS error', e); }
+}
+
+/* ============================================================
+   ACTIVITY LOGS
+   ============================================================ */
+const ALOG_MAX = 2048;
+let _alogSaveTimer = null, _alogRafId = null, _alogFilters = null;
+let _activityLog = []; // in-memory ring buffer; never stored raw on the container
+
+// ── Compression (deflate, built-in, zero-dependency) ────────
+async function _compressLog(arr) {
+    const json = JSON.stringify(arr);
+    const cs = new Blob([json]).stream().pipeThrough(new CompressionStream('deflate'));
+    return new Uint8Array(await new Response(cs).arrayBuffer());
+}
+async function _decompressLog(bytes) {
+    const ds = new Blob([bytes]).stream().pipeThrough(new DecompressionStream('deflate'));
+    return JSON.parse(await new Response(ds).text());
+}
+async function _loadActivityLog() {
+    const pending = _activityLog.length ? _activityLog.slice() : [];
+    _activityLog = [];
+    if (!App.container) return;
+    if (App.container._alogZ) {
+        try { _activityLog = await _decompressLog(App.container._alogZ); } catch { }
+    }
+    // Migrate old uncompressed format
+    if (Array.isArray(App.container.activityLog)) {
+        _activityLog = _activityLog.concat(App.container.activityLog);
+        delete App.container.activityLog;
+    }
+    // Merge any entries pushed during async decompress
+    if (pending.length) _activityLog = _activityLog.concat(pending);
+    if (_activityLog.length > ALOG_MAX) _activityLog.splice(0, _activityLog.length - ALOG_MAX);
+}
+async function _flushActivityLog() {
+    _alogSaveTimer = null;
+    if (!App.container || !_activityLog.length) return;
+    try {
+        App.container._alogZ = await _compressLog(_activityLog);
+        delete App.container.activityLog;
+        await DB.saveContainer(App.container);
+    } catch (e) { console.error('_flushActivityLog', e); }
+}
+
+// ── logActivity ─────────────────────────────────────────────
+function logActivity(op, detail, count) {
+    if (!App.container) return;
+    if (_getSettings().activityLogs === false) return;
+    const entry = { t: Date.now(), o: op, d: detail };
+    if (count > 1) entry.n = count;
+    if (App.folder && App.folder !== 'root') {
+        const p = VFS.fullPath(App.folder);
+        if (p && p !== '/') entry.p = p;
+    }
+    _activityLog.push(entry);
+    if (_activityLog.length > ALOG_MAX) _activityLog.splice(0, _activityLog.length - ALOG_MAX);
+    if (_alogSaveTimer) clearTimeout(_alogSaveTimer);
+    _alogSaveTimer = setTimeout(_flushActivityLog, 3000);
+}
+
+// ── Helpers ─────────────────────────────────────────────────
+function _alogRelTime(ts) {
+    const d = Date.now() - ts;
+    if (d < 60000) return 'Just now';
+    if (d < 3600000) return Math.floor(d / 60000) + 'm ago';
+    if (d < 86400000) return Math.floor(d / 3600000) + 'h ago';
+    if (d < 604800000) return Math.floor(d / 86400000) + 'd ago';
+    return new Date(ts).toLocaleDateString(undefined, { month: 'short', day: 'numeric', year: 'numeric' });
+}
+function _alogOpLabel(op) {
+    const map = {
+        upload: 'Uploaded', delete: 'Deleted', rename: 'Renamed', move: 'Moved',
+        copy: 'Copied', cut: 'Cut', paste: 'Pasted', 'create-file': 'Created',
+        'create-folder': 'New Folder', color: 'Color', edit: 'Saved',
+        download: 'Exported', 'export-zip': 'ZIP Export', sort: 'Sorted',
+        'export-container': 'Container Export'
+    };
+    return map[op] || op;
+}
+const _ALOG_COLORS = {
+    upload: '#3a8a4f', delete: '#c44040', rename: '#b07a20', move: '#3a6ea0',
+    copy: '#2a8a8a', cut: '#b06020', paste: '#7a309a', 'create-file': '#3a8a4f',
+    'create-folder': '#3a8a4f', color: '#a03060', edit: '#8a7020',
+    download: '#2a6aaa', 'export-zip': '#3a6ea0', sort: '#6a6a6a',
+    'export-container': '#3a6ea0'
+};
+const _ALOG_ICONS = {
+    upload:            Icons.upload,
+    delete:            Icons.trash,
+    rename:            Icons.rename,
+    move:              `<svg width="16" height="16" viewBox="0 0 16 16" fill="none"><path d="M3 8h10M9 4l4 4-4 4" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round"/></svg>`,
+    copy:              Icons.copy,
+    cut:               Icons.cut,
+    paste:             Icons.paste,
+    'create-file':     Icons.newfile,
+    'create-folder':   Icons.newfolder,
+    color:             `<svg width="16" height="16" viewBox="0 0 16 16" fill="none"><circle cx="8" cy="8" r="5.5" stroke="currentColor" stroke-width="1.4"/><circle cx="8" cy="8" r="2.5" fill="currentColor"/></svg>`,
+    edit:              Icons.save,
+    download:          Icons.download,
+    'export-zip':      `<svg width="16" height="16" viewBox="0 0 16 16" fill="none"><path d="M4 2h5l3 3v9H4z" stroke="currentColor" stroke-width="1.3" stroke-linejoin="round"/><path d="M9 2v3h3" stroke="currentColor" stroke-width="1.3"/><path d="M7 7h2v2H7zM7 10h2v2H7z" fill="currentColor" opacity=".85"/></svg>`,
+    sort:              Icons.sort,
+    'export-container':`<svg width="16" height="16" viewBox="0 0 16 16" fill="none"><rect x="2" y="2" width="12" height="12" rx="1.5" stroke="currentColor" stroke-width="1.3"/><path d="M8 5v5M5.5 8l2.5 2 2.5-2" stroke="currentColor" stroke-width="1.3" stroke-linecap="round" stroke-linejoin="round"/></svg>`
+};
+
+// ── Render: date-grouped list with badge layout ─────────────
+function _renderActivityLogs() {
+    const listEl = document.getElementById('alog-list'),
+        offEl = document.getElementById('alog-off'),
+        emptyEl = document.getElementById('alog-empty'),
+        contentEl = document.getElementById('alog-content'),
+        filtersEl = document.getElementById('alog-filters'),
+        toolbarEl = document.getElementById('alog-toolbar'),
+        s = _getSettings(),
+        log = _activityLog;
+
+    if (s.activityLogs === false) {
+        offEl.style.display = 'flex';
+        emptyEl.style.display = 'none';
+        listEl.style.display = 'none';
+        toolbarEl.style.display = 'none';
+        return;
+    }
+    offEl.style.display = 'none';
+    if (!log.length) {
+        emptyEl.style.display = 'flex';
+        listEl.style.display = 'none';
+        toolbarEl.style.display = 'none';
+        return;
+    }
+
+    toolbarEl.style.display = '';
+    emptyEl.style.display = 'none';
+    listEl.style.display = '';
+
+    // Count ops for filter chips
+    const opCounts = {};
+    log.forEach(e => { opCounts[e.o] = (opCounts[e.o] || 0) + 1; });
+    const ops = Object.keys(opCounts).sort((a, b) => opCounts[b] - opCounts[a]);
+    let filterHtml = '';
+    for (const op of ops) {
+        const active = !_alogFilters || _alogFilters.has(op);
+        filterHtml += `<button class="alog-filter${active ? ' active' : ''}" data-op="${op}">${escHtml(_alogOpLabel(op))}<span class="alog-filter-count">${opCounts[op]}</span></button>`;
+    }
+    filtersEl.innerHTML = filterHtml;
+    filtersEl.querySelectorAll('.alog-filter').forEach(btn => {
+        btn.onclick = () => {
+            const op = btn.dataset.op;
+            if (!_alogFilters) {
+                _alogFilters = new Set(ops);
+                _alogFilters.delete(op);
+            } else if (_alogFilters.has(op)) {
+                _alogFilters.delete(op);
+                if (!_alogFilters.size) _alogFilters = null;
+            } else {
+                _alogFilters.add(op);
+                if (_alogFilters.size === ops.length) _alogFilters = null;
+            }
+            _renderActivityLogs();
+        };
+    });
+
+    // Build filtered list (newest first)
+    const items = [];
+    for (let i = log.length - 1; i >= 0; i--) {
+        if (!_alogFilters || _alogFilters.has(log[i].o)) items.push(log[i]);
+    }
+
+    if (!items.length) {
+        listEl.style.display = 'none';
+        emptyEl.style.display = 'flex';
+        return;
+    }
+
+    // Group by date
+    const now = new Date(),
+        todayStart = new Date(now.getFullYear(), now.getMonth(), now.getDate()).getTime(),
+        yesterdayStart = todayStart - 86400000,
+        weekStart = todayStart - 6 * 86400000;
+    let html = '', lastGroup = '';
+    for (const it of items) {
+        let group;
+        if (it.t >= todayStart) group = 'Today';
+        else if (it.t >= yesterdayStart) group = 'Yesterday';
+        else if (it.t >= weekStart) group = 'This Week';
+        else group = 'Earlier';
+        if (group !== lastGroup) {
+            html += `<div class="alog-group">${escHtml(group)}</div>`;
+            lastGroup = group;
+        }
+        const color = _ALOG_COLORS[it.o] || '#666',
+            label = _alogOpLabel(it.o),
+            pathHtml = it.p ? ` <span class="alog-path">in ${escHtml(it.p)}</span>` : '',
+            detail = it.n > 1
+                ? `${it.n} items — ${escHtml(it.d)}${pathHtml}`
+                : `${escHtml(it.d)}${pathHtml}`,
+            time = _alogRelTime(it.t);
+        html += `<div class="alog-item"><span class="alog-badge" style="--bc:${color}">${escHtml(label)}</span><span class="alog-detail" title="${escHtml(it.d)}${it.p ? ' (' + escHtml(it.p) + ')' : ''}">${detail}</span><span class="alog-time">${escHtml(time)}</span></div>`;
+    }
+    contentEl.innerHTML = html;
+    listEl.onscroll = null;
+}
+
+// ── Clear / export helpers ──────────────────────────────────
+async function _clearActivityLog() {
+    _activityLog = [];
+    if (App.container) {
+        delete App.container._alogZ;
+        delete App.container.activityLog;
+        await DB.saveContainer(App.container);
+    }
+    _alogFilters = null;
 }
 
 
@@ -215,7 +431,7 @@ function _cancelHoverTooltip() {
 /* ============================================================
    SETTINGS
    ============================================================ */
-const SETTINGS_DEFAULTS = { iconSize: 'normal', gridDots: true, autoLock: '60', disableAnimations: false, requireExportPassword: true };
+const SETTINGS_DEFAULTS = { iconSize: 'normal', gridDots: true, autoLock: '60', disableAnimations: false, requireExportPassword: true, activityLogs: true, exportWithLogs: false, snapHighlight: true };
 
 let _autoLockTimerId = null;
 
@@ -223,7 +439,7 @@ function _resetContainerSettings() {
     // Cancel any pending auto-lock timer
     if (_autoLockTimerId) { clearTimeout(_autoLockTimerId); _autoLockTimerId = null; }
     // Reset body icon-size and animation classes to defaults
-    document.body.classList.remove('icons-small', 'icons-normal', 'icons-large', 'no-animations');
+    document.body.classList.remove('icons-small', 'icons-normal', 'icons-large', 'no-animations', 'no-snap-highlight');
     document.body.classList.add('icons-normal');
     // Reset grid constants
     GRID_X = 96;
@@ -266,6 +482,8 @@ function _applySettings(s, skipRemap = false) {
     document.querySelectorAll('.fw-area').forEach(a => a.classList.toggle('no-grid-dots', !s.gridDots));
     // Animations
     document.body.classList.toggle('no-animations', !!s.disableAnimations);
+    // Snap preview highlight
+    document.body.classList.toggle('no-snap-highlight', s.snapHighlight === false);
 }
 
 async function _saveSettings(s) {
@@ -357,6 +575,7 @@ function openSettings() {
     document.querySelectorAll('.settings-tab').forEach(t => t.classList.toggle('active', t.dataset.tab === 'personalization'));
     document.getElementById('settings-personalization').style.display = '';
     document.getElementById('settings-statistics').style.display = 'none';
+    document.getElementById('settings-activity-logs').style.display = 'none';
     // Bind tabs
     document.querySelectorAll('.settings-tab').forEach(t => {
         t.onclick = () => {
@@ -364,7 +583,9 @@ function openSettings() {
             t.classList.add('active');
             document.getElementById('settings-personalization').style.display = t.dataset.tab === 'personalization' ? '' : 'none';
             document.getElementById('settings-statistics').style.display = t.dataset.tab === 'statistics' ? '' : 'none';
+            document.getElementById('settings-activity-logs').style.display = t.dataset.tab === 'activity-logs' ? '' : 'none';
             if (t.dataset.tab === 'statistics') _renderStats();
+            if (t.dataset.tab === 'activity-logs') _renderActivityLogs();
         };
     });
     // Bind icon size buttons
@@ -389,11 +610,82 @@ function openSettings() {
         _applySettings(ns);
         await _saveSettings(ns);
     };
+    // Bind snap highlight
+    document.querySelector('#settings-snap-highlight input').checked = s.snapHighlight !== false;
+    document.querySelector('#settings-snap-highlight input').onchange = async function () {
+        const ns = { ..._getSettings(), snapHighlight: this.checked };
+        _applySettings(ns);
+        await _saveSettings(ns);
+    };
     // Bind require export password
     document.querySelector('#settings-export-pw input').checked = s.requireExportPassword !== false;
     document.querySelector('#settings-export-pw input').onchange = async function () {
         const ns = { ..._getSettings(), requireExportPassword: this.checked };
         await _saveSettings(ns);
+    };
+    // Bind activity logs toggle
+    const alogToggle = document.querySelector('#settings-activity-logs-toggle input'),
+        expLogsToggle = document.querySelector('#settings-export-logs input'),
+        expLogsRow = document.getElementById('settings-export-logs-row');
+    alogToggle.checked = s.activityLogs !== false;
+    expLogsToggle.checked = !!s.exportWithLogs;
+    expLogsRow.classList.toggle('disabled', s.activityLogs === false);
+    expLogsToggle.disabled = s.activityLogs === false;
+    alogToggle.onchange = async function () {
+        if (!this.checked) {
+            // Show confirmation before disabling
+            this.checked = true; // revert, let modal decide
+            Overlay.show('modal-alog-disable');
+            document.getElementById('alog-disable-ok').onclick = async () => {
+                Overlay.hide();
+                alogToggle.checked = false;
+                const ns = { ..._getSettings(), activityLogs: false };
+                await _saveSettings(ns);
+                await _clearActivityLog();
+                expLogsRow.classList.add('disabled');
+                expLogsToggle.disabled = true;
+                Overlay.show('modal-settings');
+            };
+            document.getElementById('alog-disable-cancel').onclick = () => {
+                Overlay.hide();
+                Overlay.show('modal-settings');
+            };
+            return;
+        }
+        const ns = { ..._getSettings(), activityLogs: true };
+        await _saveSettings(ns);
+        expLogsRow.classList.remove('disabled');
+        expLogsToggle.disabled = false;
+    };
+    expLogsToggle.onchange = async function () {
+        const ns = { ..._getSettings(), exportWithLogs: this.checked };
+        await _saveSettings(ns);
+    };
+    document.getElementById('alog-enable-btn').onclick = async () => {
+        const ns = { ..._getSettings(), activityLogs: true };
+        await _saveSettings(ns);
+        alogToggle.checked = true;
+        expLogsRow.classList.remove('disabled');
+        expLogsToggle.disabled = false;
+        _renderActivityLogs();
+    };
+    // Bind clear logs button (with confirmation)
+    document.getElementById('alog-clear-btn').onclick = () => {
+        Overlay.show('modal-alog-clear');
+        document.getElementById('alog-clear-ok').onclick = async () => {
+            Overlay.hide();
+            await _clearActivityLog();
+            Overlay.show('modal-settings');
+            document.querySelectorAll('.settings-tab').forEach(t2 => t2.classList.toggle('active', t2.dataset.tab === 'activity-logs'));
+            document.getElementById('settings-personalization').style.display = 'none';
+            document.getElementById('settings-statistics').style.display = 'none';
+            document.getElementById('settings-activity-logs').style.display = '';
+            _renderActivityLogs();
+        };
+        document.getElementById('alog-clear-cancel').onclick = () => {
+            Overlay.hide();
+            Overlay.show('modal-settings');
+        };
     };
     Overlay.show('modal-settings');
 }
@@ -751,10 +1043,9 @@ function _startIconDrag(e, node, el, srcCtx) {
     }
 
     async function _dropIntoFolder(destFid, dropX, dropY) {
-        // pre-check: cycles
+        // pre-check: cycles (includes self-move: wouldCycle(A,A) → true)
         const cycled = [];
         srcCtx.selection.forEach(id => {
-            if (id === destFid) return;
             if (VFS.wouldCycle(id, destFid)) cycled.push(VFS.node(id)?.name || id);
         });
         if (cycled.length) {
@@ -766,7 +1057,6 @@ function _startIconDrag(e, node, el, srcCtx) {
         const existing = new Set(VFS.children(destFid).map(n => n.name.toLowerCase())),
             conflicts = [];
         srcCtx.selection.forEach(id => {
-            if (id === destFid) return;
             const n = VFS.node(id); if (!n) return;
             if (n.parentId !== destFid && existing.has(n.name.toLowerCase())) conflicts.push(n.name);
         });
@@ -800,6 +1090,7 @@ function _startIconDrag(e, node, el, srcCtx) {
             }
             movedIds.push(id);
         }
+        if (movedIds.length) logActivity('move', `${movedIds.length} item${movedIds.length > 1 ? 's' : ''} → ${VFS.node(destFid)?.name || 'folder'}`, movedIds.length);
         return movedIds;
     }
 
@@ -1209,6 +1500,8 @@ const Desktop = {
         this.updateTaskbar();
         // Re-render all open folder windows
         if (typeof WinManager !== 'undefined') WinManager.renderAll();
+        // Load activity log from compressed storage (async)
+        _loadActivityLog();
     },
 
     _renderBreadcrumb() {
@@ -1335,7 +1628,7 @@ const Desktop = {
         let _touchDragNode = null, _touchDragEl = null,
             _tdStartX = 0, _tdStartY = 0, _tdOffX = 0, _tdOffY = 0,
             _tdMoved = false, _tdTimer = null, _tdActive = false,
-            _tdStartPos = {}, _tdHoverFolder = null;
+            _tdStartPos = {}, _tdHoverFolder = null, _tdSnapPrev = null;
 
         area.addEventListener('touchstart', e => {
             if (e.touches.length !== 1) return;
@@ -1421,6 +1714,27 @@ const Desktop = {
                 _tdHoverFolder = newHover;
                 if (_tdHoverFolder && folderEl) folderEl.classList.add('drag-target');
             }
+
+            // Snap preview (where icon will land on release)
+            if (_tdHoverFolder || document.body.classList.contains('no-snap-highlight')) {
+                if (_tdSnapPrev) _tdSnapPrev.style.display = 'none';
+            } else {
+                const occ = new Map();
+                VFS.children(this._desktopFolder).forEach(n => {
+                    if (this._sel.has(n.id)) return;
+                    const p = VFS.getPos(this._desktopFolder, n.id);
+                    if (p) occ.set(`${Math.round((p.x - 8) / GRID_X)}_${Math.round((p.y - 8) / GRID_Y)}`, n.id);
+                });
+                const sn = _snapFreeCell(rawX, rawY, occ);
+                if (!_tdSnapPrev) {
+                    _tdSnapPrev = document.createElement('div');
+                    _tdSnapPrev.className = 'snap-preview';
+                    area.appendChild(_tdSnapPrev);
+                }
+                _tdSnapPrev.style.left = sn.x + 'px';
+                _tdSnapPrev.style.top  = sn.y + 'px';
+                _tdSnapPrev.style.display = '';
+            }
         }, { passive: false });
 
         area.addEventListener('touchend', async e => {
@@ -1431,11 +1745,12 @@ const Desktop = {
             const node = _touchDragNode; _touchDragNode = null;
             _touchDragEl?.classList.remove('dragging');
             if (_tdHoverFolder) area.querySelector(`.file-item[data-id="${_tdHoverFolder}"]`)?.classList.remove('drag-target');
+            if (_tdSnapPrev) { _tdSnapPrev.remove(); _tdSnapPrev = null; }
 
             const occupied = new Map();
             if (_tdHoverFolder) {
                 // Move into folder
-                const cycled = [...this._sel].filter(id => id !== _tdHoverFolder && VFS.wouldCycle(id, _tdHoverFolder));
+                const cycled = [...this._sel].filter(id => VFS.wouldCycle(id, _tdHoverFolder));
                 if (cycled.length) {
                     _snapBack(_tdStartPos); toast(`Cannot move "${VFS.node(cycled[0])?.name}" into itself`, 'error'); return;
                 }
@@ -1491,6 +1806,7 @@ const Desktop = {
             if (_tdTimer) { clearTimeout(_tdTimer); _tdTimer = null; }
             if (_touchDragEl) { _touchDragEl.classList.remove('dragging'); _touchDragEl = null; }
             if (_tdHoverFolder) { area.querySelector(`.file-item[data-id="${_tdHoverFolder}"]`)?.classList.remove('drag-target'); _tdHoverFolder = null; }
+            if (_tdSnapPrev) { _tdSnapPrev.remove(); _tdSnapPrev = null; }
             _touchDragNode = null;
         }, { passive: true });
     },
@@ -1523,7 +1839,7 @@ const Desktop = {
                 label: 'Folder Color', icon: Icons.folder, submenu: FOLDER_COLORS.map(fc => ({
                     label: fc.label,
                     icon: `<span style="display:inline-block;width:12px;height:12px;border-radius:2px;background:${fc.color}"></span>`,
-                    action: async () => { node.color = fc.color === '#0078d4' ? undefined : fc.color; await saveVFS(); Desktop._patchIcons(); }
+                    action: async () => { node.color = fc.color === '#0078d4' ? undefined : fc.color; await saveVFS(); Desktop._patchIcons(); logActivity('color', `${node.name} → ${fc.label}`); }
                 }))
             });
         } else {
@@ -2006,6 +2322,9 @@ class FolderWindow {
 
         // Update title — full path
         this.el.querySelector('.fw-title').textContent = VFS.fullPath(this.folderId);
+        // Hide navup button when at top-level folder (parent is root)
+        const _navB = this.el.querySelector('.fw-btn-navup');
+        if (_navB) _navB.style.display = (node.parentId && node.parentId !== 'root') ? '' : 'none';
         // Update title bar folder icon (reflects current color)
         const _folderIconEl = this.el.querySelector('.fw-folder-icon');
         if (_folderIconEl) _folderIconEl.innerHTML = getFolderSVG(node.color);
@@ -2028,6 +2347,8 @@ class FolderWindow {
         const area = this.el.querySelector('.fw-area'),
             folderChanged = this._renderedFolderId !== this.folderId;
         this._renderedFolderId = this.folderId;
+        // Sync grid-dots setting (new window might not have the class applied yet)
+        area.classList.toggle('no-grid-dots', !_getSettings().gridDots);
 
         const items = VFS.children(this.folderId);
         items.sort((a, b) => {
@@ -2347,7 +2668,7 @@ class FolderWindow {
                 label: 'Folder Color', icon: Icons.folder, submenu: FOLDER_COLORS.map(fc => ({
                     label: fc.label,
                     icon: `<span style="display:inline-block;width:12px;height:12px;border-radius:2px;background:${fc.color}"></span>`,
-                    action: async () => { node.color = fc.color === '#0078d4' ? undefined : fc.color; await saveVFS(); self.render(); }
+                    action: async () => { node.color = fc.color === '#0078d4' ? undefined : fc.color; await saveVFS(); self.render(); logActivity('color', `${node.name} → ${fc.label}`); }
                 }))
             });
         } else {
