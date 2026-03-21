@@ -1491,6 +1491,16 @@ function _initAreaTouchRubberBand(area, owner) {
     }, { passive: true });
 }
 
+/* ---- Compute max icon extent and set area minWidth for horizontal scroll ---- */
+function _syncAreaWidth(area) {
+    let maxRight = 0;
+    for (const el of (area._iconMap?.values() ?? area.querySelectorAll(':scope > .file-item'))) {
+        const r = parseInt(el.style.left) + (el.offsetWidth || 96);
+        if (r > maxRight) maxRight = r;
+    }
+    area.style.minWidth = maxRight > 0 ? (maxRight + 8) + 'px' : '';
+}
+
 /* ---- Shared touch-drag for icons (Desktop + FolderWindow) ----
    owner implements: selection (Set-like), folderId, _updateStatus().
    opts.showSnap: boolean — true for Desktop (show snap preview dot)
@@ -2046,7 +2056,9 @@ function _startIconDrag(e, node, el, srcCtx) {
         }
 
         // ---- pre-check: open-folder guard (only when changing folder) ------
-        if (escaped || hoverFolder) {
+        // Note: for desktop items, `escaped` is never true; desktop→FW drops are caught
+        // by the extra elementFromPoint check below.
+        if (escaped || hoverFolder || document.elementFromPoint(lastX, lastY)?.closest('.folder-window')) {
             const blocked = _openFolderGuard(srcCtx.selection);
             if (blocked) {
                 _snapBackSrc();
@@ -2212,6 +2224,8 @@ function _startIconDrag(e, node, el, srcCtx) {
         await saveVFS();
         if (isDesktop) {
             srcCtx.updateUI();
+        } else {
+            _syncAreaWidth(srcArea);
         }
     };
 
@@ -3013,6 +3027,7 @@ class FolderWindow {
                 } else {
                     this._updateStatus();
                     if (typeof _applyCutStyles !== 'undefined') _applyCutStyles();
+                    _syncAreaWidth(area);
                 }
             };
             renderChunk(0);
@@ -3059,6 +3074,7 @@ class FolderWindow {
         // Sync grid dots setting with this window
         const s = _getSettings();
         area.classList.toggle('no-grid-dots', !s.gridDots);
+        _syncAreaWidth(area);
     }
 
     /* ---- MAKE ICON (for this window) ---- */
