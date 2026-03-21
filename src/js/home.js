@@ -719,7 +719,10 @@ async function doUnlock() {
         const remEl = document.getElementById('unlock-remember');
         if (remEl && remEl.checked) {
             const scope = document.querySelector('input[name="remember-scope"]:checked')?.value || 'tab';
-            try { await saveSession(c.id, pw, scope); } catch { /* non-critical */ }
+            try {
+                const rawKey = await Crypto.deriveRaw(pw, new Uint8Array(c.salt));
+                await saveSession(c.id, rawKey, scope);
+            } catch { /* non-critical */ }
         } else {
             // Checkbox unchecked — clear any previously saved session
             clearSession(c.id);
@@ -761,15 +764,14 @@ async function deleteContainerConfirmed() {
 /* ============================================================
    SESSION RESUME  —  auto-unlock using stored sessionStorage password
    ============================================================ */
-async function _resumeSession(c, pw) {
+async function _resumeSession(c, rawKeyBytes) {
     showLoading('Restoring session...');
     try {
-        const key = await Crypto.deriveKey(pw, new Uint8Array(c.salt)),
+        const key = await Crypto.importRawKey(rawKeyBytes),
             ok = await Crypto.checkVerification(key, c.verIv, c.verBlob);
         if (!ok) {
             // Stored session is invalid (password changed?) — clear it and open unlock view
-            sessionStorage.removeItem('twc-s-' + c.id);
-            localStorage.removeItem('twc-s-' + c.id);
+            clearSession(c.id);
             hideLoading();
             openUnlockView(c);
             return;

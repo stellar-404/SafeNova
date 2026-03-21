@@ -55,7 +55,14 @@ const VFS = (() => {
     function children(pid) { return Object.values(_nodes).filter(n => n.parentId === pid); }
 
     function getPos(pid, nid) { return (_pos[pid] || {})[nid] || null; }
-    function setPos(pid, nid, x, y) { if (!_pos[pid]) _pos[pid] = {}; _pos[pid][nid] = { x, y }; }
+    function setPos(pid, nid, x, y) {
+        if (!_pos[pid]) _pos[pid] = {};
+        // Always snap to the current grid so sub-pixel drift and legacy off-grid positions
+        // are corrected at write time. Math.round handles both truncation and rounding.
+        const sx = 8 + Math.max(0, Math.round((Math.round(x) - 8) / GRID_X)) * GRID_X;
+        const sy = 8 + Math.max(0, Math.round((Math.round(y) - 8) / GRID_Y)) * GRID_Y;
+        _pos[pid][nid] = { x: sx, y: sy };
+    }
     function delPos(pid, nid) { if (_pos[pid]) delete _pos[pid][nid]; }
 
     function add(nd) {

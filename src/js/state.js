@@ -34,12 +34,21 @@ async function _getOrCreateSessionKey() {
     return _sessionKey;
 }
 
-async function saveSession(cid, password, scope) {
+// Browser-scope sessions expire after 7 days; tab-scope persist until tab closes
+const SESSION_TTL_BROWSER = 7 * 24 * 60 * 60 * 1000;
+
+// rawKeyBytes — Uint8Array(32) from Crypto.deriveRaw(), never the plaintext password
+async function saveSession(cid, rawKeyBytes, scope) {
     const key = await _getOrCreateSessionKey(),
-        iv = crypto.getRandomValues(new Uint8Array(12)),
-        ct = await crypto.subtle.encrypt({ name: 'AES-GCM', iv }, key, new TextEncoder().encode(password)),
-        blob = new Uint8Array(12 + ct.byteLength);
-    blob.set(iv, 0);
+        iv = crypto.getRandomValues(new Uint8Array(12));
+    const expiryMs = scope === 'browser' ? Date.now() + SESSION_TTL_BROWSER : Number.MAX_SAFE_INTEGER;
+    const payload = new Uint8Array(8 + rawKeyBytes.length);
+    new DataView(payload.buffer).setBigUint64(0, BigInt(expiryMs), true);
+    payload.set(rawKeyBytes, 8);
+    const aad = new TextEncoder().encode('snv-session:' + cid);
+    const ct = await crypto.subtle.encrypt({ name: 'AES-GCM', iv, additionalData: aad }, key, payload);
+    const blob = new Uint8Array(12 + ct.byteLength);
+    blob.set(iv);
     blob.set(new Uint8Array(ct), 12);
     const b64 = btoa(String.fromCharCode(...blob));
     if (scope === 'browser') {
@@ -51,6 +60,7 @@ async function saveSession(cid, password, scope) {
     }
 }
 
+// Returns Uint8Array(32) raw key bytes on success, or null on failure/expiry
 async function loadSession(cid) {
     const b64 = sessionStorage.getItem('snv-s-' + cid) || localStorage.getItem('snv-sb-' + cid);
     if (!b64) return null;
@@ -59,9 +69,13 @@ async function loadSession(cid) {
             blob = Uint8Array.from(atob(b64), ch => ch.charCodeAt(0)),
             iv = blob.slice(0, 12),
             ct = blob.slice(12),
-            dec = await crypto.subtle.decrypt({ name: 'AES-GCM', iv }, key, ct);
-        return new TextDecoder().decode(dec);
-    } catch { return null; }
+            aad = new TextEncoder().encode('snv-session:' + cid),
+            dec = await crypto.subtle.decrypt({ name: 'AES-GCM', iv, additionalData: aad }, key, ct);
+        const payload = new Uint8Array(dec);
+        const expiry = Number(new DataView(payload.buffer).getBigUint64(0, true));
+        if (Date.now() > expiry) { clearSession(cid); return null; }
+        return payload.slice(8); // 32-byte raw key material
+    } catch { clearSession(cid); return null; }
 }
 
 function clearSession(cid) {

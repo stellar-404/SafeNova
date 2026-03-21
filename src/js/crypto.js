@@ -5,9 +5,9 @@
    ============================================================ */
 const Crypto = (() => {
 
-    async function deriveKey(password, salt) {
-        // Use Argon2id via hash-wasm for key derivation
-        const hash = await hashwasm.argon2id({
+    // Returns raw 32-byte Argon2id hash as Uint8Array
+    async function deriveRaw(password, salt) {
+        return hashwasm.argon2id({
             password,
             salt,
             parallelism: ARGON2_PAR,
@@ -16,8 +16,22 @@ const Crypto = (() => {
             hashLength: 32,
             outputType: 'binary',
         });
+    }
+
+    async function deriveKey(password, salt) {
+        const hash = await deriveRaw(password, salt);
         return crypto.subtle.importKey(
             'raw', hash,
+            { name: 'AES-GCM' },
+            false,
+            ['encrypt', 'decrypt']
+        );
+    }
+
+    // Import a pre-derived 32-byte key (skips Argon2id for session resume)
+    async function importRawKey(rawBytes) {
+        return crypto.subtle.importKey(
+            'raw', rawBytes,
             { name: 'AES-GCM' },
             false,
             ['encrypt', 'decrypt']
@@ -63,5 +77,5 @@ const Crypto = (() => {
         } catch { return false; }
     }
 
-    return { deriveKey, encrypt, decrypt, encryptBin, decryptBin, makeVerification, checkVerification };
+    return { deriveRaw, deriveKey, importRawKey, encrypt, decrypt, encryptBin, decryptBin, makeVerification, checkVerification };
 })();

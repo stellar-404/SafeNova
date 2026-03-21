@@ -651,6 +651,537 @@ function _rubberBandSelect(e, area, sel, onUpdate) {
 }
 
 /* ============================================================
+   UNIFIED ICON DRAG — shared by Desktop and FolderWindow
+   srcCtx = { area, folderId, selection, winEl, updateUI, clearAll }
+   winEl = null  →  source is the desktop
+   winEl = elem  →  source is a folder window
+   ============================================================ */
+function _startIconDrag(e, node, el, srcCtx) {
+    e.stopPropagation(); e.preventDefault();
+    _cancelHoverTooltip();
+
+    if (!e.ctrlKey && !e.metaKey && !srcCtx.selection.has(node.id)) srcCtx.clearAll();
+    srcCtx.selection.add(node.id);
+    el.classList.add('selected');
+    srcCtx.updateUI();
+
+    const isDesktop = srcCtx.winEl === null;
+    const srcArea = srcCtx.area;
+
+    // Elevate z-index for desktop items during drag
+    if (isDesktop) {
+        srcCtx.selection.forEach(id => {
+            const it = srcArea.querySelector(`:scope > .file-item[data-id="${id}"]`);
+            if (it) it.style.zIndex = '7900';
+        });
+    }
+
+    const areaRect = srcArea.getBoundingClientRect(),
+        elRect    = el.getBoundingClientRect(),
+        clickOffX = e.clientX - elRect.left,
+        clickOffY = e.clientY - elRect.top,
+        startX    = e.clientX,
+        startY    = e.clientY;
+
+    // Snapshot start positions of all selected icons
+    const startPosMap = {};
+    srcCtx.selection.forEach(id => {
+        const it = srcArea.querySelector(`.file-item[data-id="${id}"]`);
+        if (it) startPosMap[id] = { x: parseInt(it.style.left), y: parseInt(it.style.top) };
+    });
+
+    // Build occupied map for snap preview excluding dragged items
+    const srcOccupied = new Map();
+    VFS.children(srcCtx.folderId).forEach(n => {
+        if (srcCtx.selection.has(n.id)) return;
+        const p = VFS.getPos(srcCtx.folderId, n.id);
+        if (p) srcOccupied.set(`${Math.round((p.x - 8) / GRID_X)}_${Math.round((p.y - 8) / GRID_Y)}`, n.id);
+    });
+
+    let snapPreviewEls = [],      // previews inside the source area
+        deskSnapPreviewEls = [],  // previews on desktop (when FW item escapes to desktop)
+        winSnapPreviewEls  = [],  // previews inside a hovered FW
+        ghostEls           = [],  // ghost clones on desktop when FW item escapes
+        moved    = false,
+        escaped  = false,         // FW item currently outside its window
+        hoverFolder = null,
+        hoverWin    = null,
+        lastX = e.clientX,
+        lastY = e.clientY;
+
+    // ---- helpers ----------------------------------------------------------
+
+    function _showPreviews(previewArr, selIds, dropX, dropY, occMap, targetArea) {
+        while (previewArr.length < selIds.length) {
+            const p = document.createElement('div'); p.className = 'snap-preview';
+            targetArea.appendChild(p); previewArr.push(p);
+        }
+        while (previewArr.length > selIds.length) previewArr.pop().remove();
+        const snapOcc = new Map(occMap);
+        const mainSp = startPosMap[node.id];
+        selIds.forEach((id, i) => {
+            const sp = startPosMap[id];
+            const offX = sp && mainSp ? sp.x - mainSp.x : 0;
+            const offY = sp && mainSp ? sp.y - mainSp.y : 0;
+            const snapped = _snapFreeCell(dropX + offX, dropY + offY, snapOcc);
+            const cx = Math.round((snapped.x - 8) / GRID_X), cy = Math.round((snapped.y - 8) / GRID_Y);
+            snapOcc.set(`${cx}_${cy}`, id);
+            previewArr[i].style.left    = snapped.x + 'px';
+            previewArr[i].style.top     = snapped.y + 'px';
+            previewArr[i].style.display = '';
+        });
+    }
+
+    function _snapBackSrc() {
+        srcCtx.selection.forEach(id => {
+            const item = srcArea.querySelector(`.file-item[data-id="${id}"]`);
+            const sp   = startPosMap[id];
+            if (item && sp) {
+                item.style.transition = 'left 0.12s ease, top 0.12s ease';
+                item.style.left = sp.x + 'px'; item.style.top = sp.y + 'px';
+                setTimeout(() => { if (item.parentNode) item.style.transition = ''; }, 150);
+            }
+        });
+    }
+
+    async function _dropIntoFolder(destFid, dropX, dropY) {
+        // pre-check: cycles
+        const cycled = [];
+        srcCtx.selection.forEach(id => {
+            if (id === destFid) return;
+            if (VFS.wouldCycle(id, destFid)) cycled.push(VFS.node(id)?.name || id);
+        });
+        if (cycled.length) {
+            _snapBackSrc();
+            toast(`Cannot move "${cycled[0]}" into itself or a subfolder`, 'error');
+            return false;
+        }
+        // pre-check: duplicates
+        const existing = new Set(VFS.children(destFid).map(n => n.name.toLowerCase()));
+        const conflicts = [];
+        srcCtx.selection.forEach(id => {
+            if (id === destFid) return;
+            const n = VFS.node(id); if (!n) return;
+            if (n.parentId !== destFid && existing.has(n.name.toLowerCase())) conflicts.push(n.name);
+        });
+        if (conflicts.length) {
+            _snapBackSrc();
+            toast(`Cannot move: "${conflicts[0]}" already exists in target folder`, 'error');
+            return false;
+        }
+        // perform move
+        const movedIds  = [];
+        const occupied  = new Map();
+        VFS.children(destFid).forEach(n => {
+            const p = VFS.getPos(destFid, n.id);
+            if (p) occupied.set(`${Math.round((p.x - 8) / GRID_X)}_${Math.round((p.y - 8) / GRID_Y)}`, n.id);
+        });
+        const mainSp = startPosMap[node.id];
+        for (const id of srcCtx.selection) {
+            if (id === destFid) continue;
+            const n = VFS.node(id); if (!n) continue;
+            const result = VFS.move(id, destFid);
+            if (result === 'duplicate') { toast(`"${n.name}" already exists in target folder`, 'error'); continue; }
+            if (result === 'cycle')     { toast(`Cannot move "${n.name}" into itself or a subfolder`, 'error'); continue; }
+            if (result !== 'ok')        { continue; }
+            if (dropX !== null) {
+                const sp   = startPosMap[id];
+                const offX = sp && mainSp ? sp.x - mainSp.x : 0;
+                const offY = sp && mainSp ? sp.y - mainSp.y : 0;
+                const sn   = _snapFreeCell(dropX + offX, dropY + offY, occupied);
+                VFS.setPos(destFid, id, sn.x, sn.y);
+                occupied.set(`${Math.round((sn.x - 8) / GRID_X)}_${Math.round((sn.y - 8) / GRID_Y)}`, id);
+            }
+            movedIds.push(id);
+        }
+        return movedIds;
+    }
+
+    // ---- onMove -----------------------------------------------------------
+
+    const onMove = mv => {
+        lastX = mv.clientX; lastY = mv.clientY;
+        if (!moved && (Math.abs(mv.clientX - startX) + Math.abs(mv.clientY - startY)) > 4) {
+            moved = true; _isDragging = true; _cancelHoverTooltip();
+        }
+        if (!moved) return;
+
+        const mainSp = startPosMap[node.id];
+        const curAreaRect = srcArea.getBoundingClientRect();
+        const targetMainX = mv.clientX - curAreaRect.left + srcArea.scrollLeft - clickOffX;
+        const targetMainY = mv.clientY - curAreaRect.top  + srcArea.scrollTop  - clickOffY;
+        const dx = targetMainX - mainSp.x;
+        const dy = targetMainY - mainSp.y;
+
+        // ---- FW-specific: escape / re-enter --------------------------------
+        if (!isDesktop) {
+            const winRect = srcCtx.winEl.getBoundingClientRect();
+            const outsideWindow = mv.clientX < winRect.left || mv.clientX > winRect.right ||
+                                  mv.clientY < winRect.top  || mv.clientY > winRect.bottom;
+
+            if (!outsideWindow && escaped) {
+                // Re-entered source window — cancel escape
+                escaped = false;
+                ghostEls.forEach(g => g.remove()); ghostEls = [];
+                deskSnapPreviewEls.forEach(p => p.remove()); deskSnapPreviewEls = [];
+                winSnapPreviewEls.forEach(p => p.remove()); winSnapPreviewEls = [];
+                srcCtx.selection.forEach(id => {
+                    const orig = srcArea.querySelector(`.file-item[data-id="${id}"]`);
+                    if (orig) orig.style.visibility = '';
+                });
+            }
+            if (outsideWindow && !escaped) {
+                // Escaping — hide originals, spawn ghosts on desktop
+                escaped = true;
+                srcCtx.selection.forEach(id => {
+                    const orig = srcArea.querySelector(`.file-item[data-id="${id}"]`);
+                    if (orig) orig.style.visibility = 'hidden';
+                });
+                const deskArea = document.getElementById('desktop-area');
+                const selIds = [...srcCtx.selection].sort((a, b) => a === node.id ? -1 : b === node.id ? 1 : 0);
+                selIds.forEach(id => {
+                    const n = VFS.node(id); if (!n) return;
+                    const g = _buildIconEl(n, { x: 0, y: 0 });
+                    g.classList.add('selected');
+                    g.style.cssText += ';position:absolute;z-index:7900;opacity:0.7;pointer-events:none;will-change:left,top';
+                    g.dataset.ghostFor = id;
+                    deskArea.appendChild(g);
+                    ghostEls.push(g);
+                });
+            }
+        }
+
+        // ---- position items / ghosts ---------------------------------------
+        if (!escaped) {
+            srcCtx.selection.forEach(id => {
+                const it = srcArea.querySelector(`.file-item[data-id="${id}"]`);
+                const sp = startPosMap[id];
+                if (it && sp) { it.style.left = (sp.x + dx) + 'px'; it.style.top = (sp.y + dy) + 'px'; }
+            });
+        } else {
+            const deskArea = document.getElementById('desktop-area');
+            const deskRect = deskArea.getBoundingClientRect();
+            const baseX = mv.clientX - deskRect.left + deskArea.scrollLeft - clickOffX;
+            const baseY = mv.clientY - deskRect.top  + deskArea.scrollTop  - clickOffY;
+            ghostEls.forEach(g => {
+                const sp = startPosMap[g.dataset.ghostFor];
+                const offX = sp && mainSp ? sp.x - mainSp.x : 0;
+                const offY = sp && mainSp ? sp.y - mainSp.y : 0;
+                g.style.left = (baseX + offX) + 'px';
+                g.style.top  = (baseY + offY) + 'px';
+            });
+        }
+
+        // ---- hover-folder highlight ----------------------------------------
+        if (!escaped) {
+            srcCtx.selection.forEach(id => {
+                const it = srcArea.querySelector(`.file-item[data-id="${id}"]`);
+                if (it) it.style.pointerEvents = 'none';
+            });
+        }
+        const target = document.elementFromPoint(mv.clientX, mv.clientY);
+        if (!escaped) {
+            srcCtx.selection.forEach(id => {
+                const it = srcArea.querySelector(`.file-item[data-id="${id}"]`);
+                if (it) it.style.pointerEvents = '';
+            });
+        }
+        const folderEl = target?.closest('.file-item[data-id]');
+        const newHover = folderEl && !srcCtx.selection.has(folderEl.dataset.id) &&
+            VFS.node(folderEl.dataset.id)?.type === 'folder' ? folderEl.dataset.id : null;
+        if (newHover !== hoverFolder) {
+            if (hoverFolder) document.querySelectorAll(`.file-item[data-id="${hoverFolder}"]`).forEach(i => i.classList.remove('drag-target'));
+            hoverFolder = newHover;
+            if (hoverFolder) document.querySelectorAll(`.file-item[data-id="${hoverFolder}"]`).forEach(i => i.classList.add('drag-target'));
+        }
+
+        // ---- hovered FW (excluding source window) -------------------------
+        const fwElt  = !hoverFolder ? target?.closest('.folder-window') : null;
+        const curWin = fwElt ? (typeof WinManager !== 'undefined' ? WinManager._wins.find(w => w.el === fwElt) : null) : null;
+        const effectiveHoverWin = (curWin && curWin.el !== srcCtx.winEl) ? curWin : null;
+        if (effectiveHoverWin !== hoverWin) {
+            winSnapPreviewEls.forEach(p => p.remove()); winSnapPreviewEls = [];
+            hoverWin = effectiveHoverWin;
+        }
+
+        // ---- snap previews ------------------------------------------------
+        if (!moved) return;
+
+        if (hoverFolder) {
+            snapPreviewEls.forEach(p => p.style.display = 'none');
+            deskSnapPreviewEls.forEach(p => p.style.display = 'none');
+            winSnapPreviewEls.forEach(p => p.style.display = 'none');
+        } else if (hoverWin) {
+            snapPreviewEls.forEach(p => p.style.display = 'none');
+            deskSnapPreviewEls.forEach(p => p.style.display = 'none');
+            const winArea = hoverWin.el.querySelector('.fw-area');
+            const wRect   = winArea.getBoundingClientRect();
+            const dropX   = mv.clientX - wRect.left + winArea.scrollLeft - clickOffX;
+            const dropY   = mv.clientY - wRect.top  + winArea.scrollTop  - clickOffY;
+            const winOcc  = new Map();
+            VFS.children(hoverWin.folderId).forEach(n => {
+                const p = VFS.getPos(hoverWin.folderId, n.id);
+                if (p) winOcc.set(`${Math.round((p.x - 8) / GRID_X)}_${Math.round((p.y - 8) / GRID_Y)}`, n.id);
+            });
+            _showPreviews(winSnapPreviewEls, [...srcCtx.selection], dropX, dropY, winOcc, winArea);
+        } else if (escaped) {
+            // on desktop (FW items that escaped)
+            snapPreviewEls.forEach(p => p.style.display = 'none');
+            winSnapPreviewEls.forEach(p => p.style.display = 'none');
+            const deskArea = document.getElementById('desktop-area');
+            const dRect    = deskArea.getBoundingClientRect();
+            const dropX    = mv.clientX - dRect.left + deskArea.scrollLeft - clickOffX;
+            const dropY    = mv.clientY - dRect.top  + deskArea.scrollTop  - clickOffY;
+            const deskOcc  = new Map();
+            VFS.children(Desktop._desktopFolder).forEach(n => {
+                const p = VFS.getPos(Desktop._desktopFolder, n.id);
+                if (p) deskOcc.set(`${Math.round((p.x - 8) / GRID_X)}_${Math.round((p.y - 8) / GRID_Y)}`, n.id);
+            });
+            _showPreviews(deskSnapPreviewEls, [...srcCtx.selection], dropX, dropY, deskOcc, deskArea);
+        } else {
+            // within source area (desktop or FW)
+            deskSnapPreviewEls.forEach(p => p.style.display = 'none');
+            winSnapPreviewEls.forEach(p => p.style.display = 'none');
+            _showPreviews(snapPreviewEls, [...srcCtx.selection], mainSp.x + dx, mainSp.y + dy, srcOccupied, srcArea);
+        }
+    };
+
+    // ---- onUp -------------------------------------------------------------
+
+    const onUp = async () => {
+        document.removeEventListener('mousemove', onMove);
+        document.removeEventListener('mouseup', onUp);
+        _isDragging = false;
+        snapPreviewEls.forEach(p => p.remove());     snapPreviewEls = [];
+        deskSnapPreviewEls.forEach(p => p.remove()); deskSnapPreviewEls = [];
+        winSnapPreviewEls.forEach(p => p.remove());  winSnapPreviewEls = [];
+        if (hoverFolder) document.querySelectorAll(`.file-item[data-id="${hoverFolder}"]`).forEach(i => i.classList.remove('drag-target'));
+        ghostEls.forEach(g => g.remove()); ghostEls = [];
+
+        // Restore desktop z-index
+        if (isDesktop) {
+            srcCtx.selection.forEach(id => {
+                const it = srcArea.querySelector(`:scope > .file-item[data-id="${id}"]`);
+                if (it) it.style.zIndex = '';
+            });
+        }
+
+        if (!moved) {
+            // Click without drag — restore visibility for FW items
+            if (!isDesktop) {
+                srcCtx.selection.forEach(id => {
+                    const orig = srcArea.querySelector(`.file-item[data-id="${id}"]`);
+                    if (orig) orig.style.visibility = '';
+                });
+            }
+            return;
+        }
+
+        // ---- pre-check: open-folder guard (only when changing folder) ------
+        if ((escaped || hoverFolder) && typeof WinManager !== 'undefined') {
+            const openFolderIds = new Set();
+            WinManager._wins.forEach(w => {
+                let cur = w.folderId;
+                while (cur && cur !== 'root') { openFolderIds.add(cur); cur = (VFS.node(cur) || {}).parentId; }
+            });
+            const dropT  = document.elementFromPoint(lastX, lastY);
+            const tfw    = dropT?.closest('.folder-window');
+            const tw     = tfw ? WinManager._wins.find(w => w.el === tfw) : null;
+            const tFid   = hoverFolder || (tw ? tw.folderId : null);
+            const blocked = Array.from(srcCtx.selection).find(id => {
+                const n = VFS.node(id);
+                if (!n || n.type !== 'folder' || !openFolderIds.has(id)) return false;
+                if (tFid && VFS.wouldCycle(id, tFid)) return false;
+                return true;
+            });
+            if (blocked) {
+                _snapBackSrc();
+                if (!isDesktop) {
+                    srcCtx.selection.forEach(id => {
+                        const orig = srcArea.querySelector(`.file-item[data-id="${id}"]`);
+                        if (orig) orig.style.visibility = '';
+                    });
+                }
+                toast(`"${VFS.node(blocked)?.name}" is open in Explorer — close the window first`, 'error');
+                return;
+            }
+        }
+
+        // ---- Case 1: FW item escaped → dropped back in same window (race) --
+        if (!isDesktop && escaped) {
+            const srcR = srcCtx.winEl.getBoundingClientRect();
+            if (lastX >= srcR.left && lastX <= srcR.right && lastY >= srcR.top && lastY <= srcR.bottom) {
+                srcCtx.selection.forEach(id => {
+                    const orig = srcArea.querySelector(`.file-item[data-id="${id}"]`);
+                    if (orig) orig.style.visibility = '';
+                });
+                return;
+            }
+        }
+
+        // Determine actual drop zone
+        const dropTarget = document.elementFromPoint(lastX, lastY);
+        const tFwEl  = dropTarget?.closest('.folder-window');
+        const tWin   = tFwEl ? (typeof WinManager !== 'undefined' ? WinManager._wins.find(w => w.el === tFwEl) : null) : null;
+        const actualHoverWin = (tWin && tWin.el !== srcCtx.winEl) ? tWin : null;
+
+        // ---- Case 2: dropped onto a folder icon ----------------------------
+        if (hoverFolder) {
+            const movedIds = await _dropIntoFolder(hoverFolder, null, null);
+            if (movedIds === false) {
+                if (!isDesktop) srcCtx.selection.forEach(id => {
+                    const orig = srcArea.querySelector(`.file-item[data-id="${id}"]`);
+                    if (orig) orig.style.visibility = '';
+                });
+                return;
+            }
+            const targetWinForFolder = typeof WinManager !== 'undefined' ? WinManager._wins.find(w => w.folderId === hoverFolder) : null;
+            if (targetWinForFolder) targetWinForFolder._clearSelection();
+            movedIds.forEach(id => {
+                srcCtx.selection.delete(id);
+                if (targetWinForFolder) targetWinForFolder.selection.add(id);
+                srcArea.querySelector(`:scope > .file-item[data-id="${id}"]`)?.remove();
+                if (!isDesktop) srcArea.querySelector(`.file-item[data-id="${id}"]`)?.remove();
+            });
+            // snap back failures
+            if (!isDesktop) srcCtx.selection.forEach(id => {
+                const orig = srcArea.querySelector(`.file-item[data-id="${id}"]`);
+                if (orig) orig.style.visibility = '';
+            });
+            srcCtx.updateUI();
+            await saveVFS();
+            if (typeof WinManager !== 'undefined') WinManager.renderAll();
+            return;
+        }
+
+        // ---- Case 3: dropped onto a folder window -------------------------
+        if (actualHoverWin || (!isDesktop && escaped && !hoverFolder)) {
+            const targetWin = actualHoverWin;
+            if (targetWin) {
+                const tArea   = targetWin.el.querySelector('.fw-area');
+                const tRect   = tArea.getBoundingClientRect();
+                const dropPosX = lastX - tRect.left + tArea.scrollLeft - clickOffX;
+                const dropPosY = lastY - tRect.top  + tArea.scrollTop  - clickOffY;
+                const movedIds = await _dropIntoFolder(targetWin.folderId, dropPosX, dropPosY);
+                if (movedIds === false) {
+                    if (!isDesktop) srcCtx.selection.forEach(id => {
+                        const orig = srcArea.querySelector(`.file-item[data-id="${id}"]`);
+                        if (orig) orig.style.visibility = '';
+                    });
+                    return;
+                }
+                const srcWin = !isDesktop ? (typeof WinManager !== 'undefined' ? WinManager._wins.find(w => w.el === srcCtx.winEl) : null) : null;
+                targetWin._clearSelection();
+                movedIds.forEach(id => {
+                    srcCtx.selection.delete(id);
+                    targetWin.selection.add(id);
+                    const orig = srcArea.querySelector(`.file-item[data-id="${id}"]`);
+                    if (orig) orig.remove();
+                    if (isDesktop) srcArea.querySelector(`:scope > .file-item[data-id="${id}"]`)?.remove();
+                });
+                // snap back failures
+                if (!isDesktop) srcCtx.selection.forEach(id => {
+                    const orig = srcArea.querySelector(`.file-item[data-id="${id}"]`);
+                    if (orig) orig.style.visibility = '';
+                });
+                srcCtx.updateUI();
+                await saveVFS();
+                targetWin.render();
+                return;
+            }
+        }
+
+        // ---- Case 4a: FW item dropped onto desktop ------------------------
+        if (!isDesktop && escaped) {
+            const deskArea = document.getElementById('desktop-area');
+            const dRect    = deskArea.getBoundingClientRect();
+            const dropPosX = lastX - dRect.left + deskArea.scrollLeft - clickOffX;
+            const dropPosY = lastY - dRect.top  + deskArea.scrollTop  - clickOffY;
+            const deskFid  = Desktop._desktopFolder;
+            const occupied = new Map();
+            VFS.children(deskFid).forEach(n => {
+                const p = VFS.getPos(deskFid, n.id);
+                if (p) occupied.set(`${Math.round((p.x - 8) / GRID_X)}_${Math.round((p.y - 8) / GRID_Y)}`, n.id);
+            });
+            const mainSp = startPosMap[node.id];
+            const movedIds = [];
+            for (const id of srcCtx.selection) {
+                const n = VFS.node(id); if (!n) continue;
+                const result = VFS.move(id, deskFid);
+                if (result === 'duplicate') { toast(`"${n.name}" already exists on desktop`, 'error'); continue; }
+                if (result === 'cycle')     { toast(`Cannot move "${n.name}" into itself`, 'error'); continue; }
+                const sp   = startPosMap[id];
+                const offX = sp && mainSp ? sp.x - mainSp.x : 0;
+                const offY = sp && mainSp ? sp.y - mainSp.y : 0;
+                const sn   = _snapFreeCell(dropPosX + offX, dropPosY + offY, occupied);
+                VFS.setPos(deskFid, id, sn.x, sn.y);
+                occupied.set(`${Math.round((sn.x - 8) / GRID_X)}_${Math.round((sn.y - 8) / GRID_Y)}`, id);
+                movedIds.push(id);
+            }
+            Desktop._sel.clear();
+            document.querySelectorAll('#desktop-area > .file-item.selected').forEach(i => i.classList.remove('selected'));
+            movedIds.forEach(id => {
+                srcCtx.selection.delete(id);
+                Desktop._sel.add(id);
+                srcArea.querySelector(`.file-item[data-id="${id}"]`)?.remove();
+            });
+            // snap back failures
+            srcCtx.selection.forEach(id => {
+                const orig = srcArea.querySelector(`.file-item[data-id="${id}"]`);
+                if (orig) {
+                    orig.style.visibility = '';
+                    const sp = startPosMap[id];
+                    if (sp) {
+                        orig.style.transition = 'left 0.15s ease, top 0.15s ease';
+                        orig.style.left = sp.x + 'px'; orig.style.top = sp.y + 'px';
+                        setTimeout(() => { if (orig.parentNode) orig.style.transition = ''; }, 160);
+                    }
+                }
+            });
+            srcCtx.updateUI();
+            await saveVFS();
+            Desktop._patchIcons();
+            return;
+        }
+
+        // ---- Case 4b: within-source snap ----------------------------------
+        if (!isDesktop) {
+            // restore visibility first
+            srcCtx.selection.forEach(id => {
+                const orig = srcArea.querySelector(`.file-item[data-id="${id}"]`);
+                if (orig) orig.style.visibility = '';
+            });
+        }
+        // Grid snap within source area
+        const occupied = new Map();
+        VFS.children(srcCtx.folderId).forEach(n => {
+            if (srcCtx.selection.has(n.id)) return;
+            const p = VFS.getPos(srcCtx.folderId, n.id);
+            if (p) occupied.set(`${Math.round((p.x - 8) / GRID_X)}_${Math.round((p.y - 8) / GRID_Y)}`, n.id);
+        });
+        srcCtx.selection.forEach(id => {
+            const item = srcArea.querySelector(`.file-item[data-id="${id}"]`);
+            if (!item) return;
+            const rawX    = parseInt(item.style.left), rawY = parseInt(item.style.top);
+            const snapped = _snapFreeCell(rawX, rawY, occupied);
+            const cx = Math.round((snapped.x - 8) / GRID_X), cy = Math.round((snapped.y - 8) / GRID_Y);
+            occupied.set(`${cx}_${cy}`, id);
+            item.style.transition = 'left 0.12s ease, top 0.12s ease';
+            item.style.left = snapped.x + 'px'; item.style.top = snapped.y + 'px';
+            setTimeout(() => { if (item.parentNode) item.style.transition = ''; }, 150);
+            VFS.setPos(srcCtx.folderId, id, snapped.x, snapped.y);
+        });
+        await saveVFS();
+        if (isDesktop) {
+            srcCtx.updateUI();
+        }
+    };
+
+    document.addEventListener('mousemove', onMove);
+    document.addEventListener('mouseup', onUp);
+}
+
+/* ============================================================
    DESKTOP
    ============================================================ */
 const Desktop = {
@@ -776,394 +1307,19 @@ const Desktop = {
     _onIconMousedown(e, el, node) {
         if (e.button !== 0) return;
         hideCtxMenu();
-        e.stopPropagation();
-        e.preventDefault(); // prevent text selection while dragging
-        _cancelHoverTooltip();
-
-        if (!e.ctrlKey && !e.metaKey && !this._sel.has(node.id)) {
-            this._sel.clear();
-            document.querySelectorAll('#desktop-area > .file-item.selected').forEach(i => i.classList.remove('selected'));
-        }
-        this._sel.add(node.id);
-        el.classList.add('selected');
-        this._updateSelectionBar();
-
-        // Elevate z-index of all selected items above folder windows during drag
-        this._sel.forEach(id => {
-            const item = document.querySelector(`#desktop-area > .file-item[data-id="${id}"]`);
-            if (item) item.style.zIndex = '7900';
+        _startIconDrag(e, node, el, {
+            area:      document.getElementById('desktop-area'),
+            folderId:  this._desktopFolder,
+            selection: this._sel,
+            winEl:     null,
+            updateUI:  () => { this._updateSelectionBar(); this.updateTaskbar(); },
+            clearAll:  () => {
+                this._sel.clear();
+                document.querySelectorAll('#desktop-area > .file-item.selected').forEach(i => i.classList.remove('selected'));
+            },
         });
-
-        const startX = e.clientX, startY = e.clientY,
-            area = document.getElementById('desktop-area'),
-            areaRect = area.getBoundingClientRect(),
-            elRect = el.getBoundingClientRect(),
-            clickOffX = e.clientX - elRect.left,
-            clickOffY = e.clientY - elRect.top,
-            startScrollX = area.scrollLeft, startScrollY = area.scrollTop,
-            startPosMap = {};
-        this._sel.forEach(id => {
-            const item = document.querySelector(`#desktop-area > .file-item[data-id="${id}"]`);
-            if (item) startPosMap[id] = { x: parseInt(item.style.left), y: parseInt(item.style.top) };
-        });
-        // Build occupied map for snap preview (exclude dragged items)
-        const occupiedAtStart = new Map();
-        VFS.children(this._desktopFolder).forEach(n => {
-            if (this._sel.has(n.id)) return;
-            const p = VFS.getPos(this._desktopFolder, n.id);
-            if (p) occupiedAtStart.set(`${Math.round((p.x - 8) / GRID_X)}_${Math.round((p.y - 8) / GRID_Y)}`, n.id);
-        });
-        let snapPreviewEls = [],
-            fwSnapPreviewEls = [],  // snap previews inside a hovered folder-window
-            moved = false, hoverFolder = null, hoverWin = null, lastX = e.clientX, lastY = e.clientY;
-
-        const onMove = mv => {
-            lastX = mv.clientX; lastY = mv.clientY;
-            const mainPos = startPosMap[node.id];
-            const targetMainX = mv.clientX - areaRect.left + area.scrollLeft - clickOffX;
-            const targetMainY = mv.clientY - areaRect.top + area.scrollTop - clickOffY;
-            const dx = targetMainX - mainPos.x;
-            const dy = targetMainY - mainPos.y;
-            if (!moved && (Math.abs(mv.clientX - startX) + Math.abs(mv.clientY - startY)) > 4) {
-                moved = true; _isDragging = true; _cancelHoverTooltip();
-            }
-            if (!moved) return;
-            this._sel.forEach(id => {
-                const item = document.querySelector(`#desktop-area > .file-item[data-id="${id}"]`);
-                const sp = startPosMap[id];
-                if (item && sp) { item.style.left = (sp.x + dx) + 'px'; item.style.top = (sp.y + dy) + 'px'; }
-            });
-            // Highlight folder under cursor (hide dragged items briefly for elementFromPoint)
-            this._sel.forEach(id => {
-                const it = document.querySelector(`#desktop-area > .file-item[data-id="${id}"]`);
-                if (it) it.style.pointerEvents = 'none';
-            });
-            const target = document.elementFromPoint(mv.clientX, mv.clientY);
-            this._sel.forEach(id => {
-                const it = document.querySelector(`#desktop-area > .file-item[data-id="${id}"]`);
-                if (it) it.style.pointerEvents = '';
-            });
-            const folderEl = target?.closest('.file-item[data-id]');
-            const newHover = folderEl && !this._sel.has(folderEl.dataset.id) &&
-                VFS.node(folderEl.dataset.id)?.type === 'folder' ? folderEl.dataset.id : null;
-            if (newHover !== hoverFolder) {
-                if (hoverFolder) document.querySelectorAll(`.file-item[data-id="${hoverFolder}"]`).forEach(el => el.classList.remove('drag-target'));
-                hoverFolder = newHover;
-                if (hoverFolder && folderEl) folderEl.classList.add('drag-target');
-            }
-            // Detect if cursor is over a folder-window (but not hovering a folder icon)
-            const fwEl = !hoverFolder ? target?.closest('.folder-window') : null;
-            const curWin = fwEl ? (typeof WinManager !== 'undefined' ? WinManager._wins.find(w => w.el === fwEl) : null) : null;
-            if (curWin !== hoverWin) {
-                fwSnapPreviewEls.forEach(p => p.remove()); fwSnapPreviewEls = [];
-                hoverWin = curWin;
-            }
-            // Snap preview: folder-icon hover > folder-window hover > desktop
-            if (hoverFolder) {
-                snapPreviewEls.forEach(p => p.style.display = 'none');
-                fwSnapPreviewEls.forEach(p => p.style.display = 'none');
-            } else if (hoverWin) {
-                // Show snap preview inside the hovered folder window
-                snapPreviewEls.forEach(p => p.style.display = 'none');
-                const winArea = hoverWin.el.querySelector('.fw-area');
-                const winRect = winArea.getBoundingClientRect();
-                const dropX = mv.clientX - winRect.left + winArea.scrollLeft - clickOffX;
-                const dropY = mv.clientY - winRect.top + winArea.scrollTop - clickOffY;
-                const winOcc = new Map();
-                VFS.children(hoverWin.folderId).forEach(n => {
-                    const p = VFS.getPos(hoverWin.folderId, n.id);
-                    if (p) winOcc.set(`${Math.round((p.x - 8) / GRID_X)}_${Math.round((p.y - 8) / GRID_Y)}`, n.id);
-                });
-                const selIds = [...this._sel];
-                while (fwSnapPreviewEls.length < selIds.length) {
-                    const pEl = document.createElement('div'); pEl.className = 'snap-preview';
-                    winArea.appendChild(pEl); fwSnapPreviewEls.push(pEl);
-                }
-                while (fwSnapPreviewEls.length > selIds.length) { fwSnapPreviewEls.pop().remove(); }
-                const snapOcc = new Map(winOcc);
-                const mainSp = startPosMap[node.id];
-                selIds.forEach((id, i) => {
-                    const sp = startPosMap[id];
-                    const offX = sp && mainSp ? sp.x - mainSp.x : 0;
-                    const offY = sp && mainSp ? sp.y - mainSp.y : 0;
-                    const snapped = _snapFreeCell(dropX + offX, dropY + offY, snapOcc);
-                    const cx = Math.round((snapped.x - 8) / GRID_X), cy = Math.round((snapped.y - 8) / GRID_Y);
-                    snapOcc.set(`${cx}_${cy}`, id);
-                    fwSnapPreviewEls[i].style.left = snapped.x + 'px';
-                    fwSnapPreviewEls[i].style.top = snapped.y + 'px';
-                    fwSnapPreviewEls[i].style.display = '';
-                });
-            } else {
-                // Snap preview on desktop
-                fwSnapPreviewEls.forEach(p => p.style.display = 'none');
-                const mainSp = startPosMap[node.id];
-                if (mainSp) {
-                    const selIds = [...this._sel];
-                    while (snapPreviewEls.length < selIds.length) {
-                        const pEl = document.createElement('div'); pEl.className = 'snap-preview';
-                        area.appendChild(pEl); snapPreviewEls.push(pEl);
-                    }
-                    while (snapPreviewEls.length > selIds.length) { snapPreviewEls.pop().remove(); }
-                    // Each item finds its own nearest free cell (so previews never overlap folders)
-                    const snapOccupied = new Map(occupiedAtStart);
-                    selIds.forEach((id, i) => {
-                        const sp = startPosMap[id]; if (!sp) return;
-                        const snapped = _snapFreeCell(sp.x + dx, sp.y + dy, snapOccupied);
-                        const cx = Math.round((snapped.x - 8) / GRID_X);
-                        const cy = Math.round((snapped.y - 8) / GRID_Y);
-                        snapOccupied.set(`${cx}_${cy}`, id);
-                        snapPreviewEls[i].style.left = snapped.x + 'px';
-                        snapPreviewEls[i].style.top = snapped.y + 'px';
-                        snapPreviewEls[i].style.display = '';
-                    });
-                }
-            }
-        };
-
-        const onUp = async () => {
-            document.removeEventListener('mousemove', onMove);
-            document.removeEventListener('mouseup', onUp);
-            _isDragging = false;
-            snapPreviewEls.forEach(p => p.remove()); snapPreviewEls = [];
-            fwSnapPreviewEls.forEach(p => p.remove()); fwSnapPreviewEls = [];
-            if (hoverFolder) document.querySelectorAll(`.file-item[data-id="${hoverFolder}"]`).forEach(el => el.classList.remove('drag-target'));
-
-            // Restore z-index (will be overwritten by next render anyway)
-            this._sel.forEach(id => {
-                const item = document.querySelector(`#desktop-area > .file-item[data-id="${id}"]`);
-                if (item) item.style.zIndex = '';
-            });
-
-            if (moved) {
-                // Check if dropped onto a folder window
-                const dropTarget = document.elementFromPoint(lastX, lastY);
-                const fwEl = dropTarget?.closest('.folder-window');
-                const isChangingFolder = (fwEl && WinManager._wins.find(w => w.el === fwEl)) || hoverFolder;
-
-                let blocked = null;
-                if (isChangingFolder && typeof WinManager !== 'undefined') {
-                    const openFolderIds = new Set();
-                    WinManager._wins.forEach(w => {
-                        let cur = w.folderId;
-                        while (cur && cur !== 'root') { openFolderIds.add(cur); cur = (VFS.node(cur) || {}).parentId; }
-                    });
-                    // Determine drop target folder to skip items that would produce a cycle anyway
-                    const _targetFId = hoverFolder ||
-                        (fwEl ? WinManager._wins.find(w => w.el === fwEl)?.folderId : null);
-                    blocked = Array.from(this._sel).find(id => {
-                        const n = VFS.node(id);
-                        if (!n || n.type !== 'folder' || !openFolderIds.has(id)) return false;
-                        // If it's a cycle, the cycle check will handle it — don't pre-empt with wrong error
-                        if (_targetFId && VFS.wouldCycle(id, _targetFId)) return false;
-                        return true;
-                    });
-                }
-                if (blocked) {
-                    this._sel.forEach(id => {
-                        const item = document.querySelector(`#desktop-area > .file-item[data-id="${id}"]`);
-                        const sp = startPosMap[id];
-                        if (item && sp) {
-                            item.style.transition = 'left 0.12s ease, top 0.12s ease';
-                            item.style.left = sp.x + 'px'; item.style.top = sp.y + 'px';
-                            setTimeout(() => { if (item.parentNode) item.style.transition = ''; }, 150);
-                        }
-                    });
-                    toast(`“${VFS.node(blocked)?.name}” is open in Explorer — close the window first`, 'error');
-                    return;
-                }
-
-                if (fwEl && !hoverFolder) {
-                    const winTarget = WinManager._wins.find(w => w.el === fwEl);
-                    if (winTarget) {
-                        // Pre-check duplicates before moving
-                        const targetChildren = VFS.children(winTarget.folderId);
-                        const existingNames = new Set(targetChildren.map(n => n.name.toLowerCase()));
-                        const conflicts = [];
-                        this._sel.forEach(id => {
-                            const n = VFS.node(id); if (!n) return;
-                            if (n.parentId !== winTarget.folderId && existingNames.has(n.name.toLowerCase())) conflicts.push(n.name);
-                        });
-                        if (conflicts.length) {
-                            this._sel.forEach(id => {
-                                const item = document.querySelector(`#desktop-area > .file-item[data-id="${id}"]`);
-                                const sp = startPosMap[id];
-                                if (item && sp) {
-                                    item.style.transition = 'left 0.12s ease, top 0.12s ease';
-                                    item.style.left = sp.x + 'px'; item.style.top = sp.y + 'px';
-                                    setTimeout(() => { if (item.parentNode) item.style.transition = ''; }, 150);
-                                }
-                            });
-                            toast(`Cannot move: "${conflicts[0]}" already exists in target folder`, 'error');
-                            return;
-                        }
-                        // Pre-check: verify no cycles before attempting any move
-                        const winCycled = [];
-                        this._sel.forEach(id => {
-                            if (VFS.wouldCycle(id, winTarget.folderId)) winCycled.push(VFS.node(id)?.name || id);
-                        });
-                        if (winCycled.length) {
-                            this._sel.forEach(id => {
-                                const item = document.querySelector(`#desktop-area > .file-item[data-id="${id}"]`);
-                                const sp = startPosMap[id];
-                                if (item && sp) {
-                                    item.style.transition = 'left 0.12s ease, top 0.12s ease';
-                                    item.style.left = sp.x + 'px'; item.style.top = sp.y + 'px';
-                                    setTimeout(() => { if (item.parentNode) item.style.transition = ''; }, 150);
-                                }
-                            });
-                            toast(`Cannot move "${winCycled[0]}" into itself or a subfolder`, 'error');
-                            return;
-                        }
-                        // Smart drop: calculate position in target window at cursor location
-                        const targetArea = winTarget.el.querySelector('.fw-area'),
-                            tRect = targetArea.getBoundingClientRect(),
-                            dropPosX = lastX - tRect.left + targetArea.scrollLeft - clickOffX,
-                            dropPosY = lastY - tRect.top + targetArea.scrollTop - clickOffY,
-                            occupied = new Map();
-                        VFS.children(winTarget.folderId).forEach(n => {
-                            const p = VFS.getPos(winTarget.folderId, n.id);
-                            if (p) occupied.set(`${Math.round((p.x - 8) / GRID_X)}_${Math.round((p.y - 8) / GRID_Y)}`, n.id);
-                        });
-                        const movedIds = [];
-                        const mainSp = startPosMap[node.id];
-                        this._sel.forEach(id => {
-                            const n = VFS.node(id); if (!n) return;
-                            const result = VFS.move(id, winTarget.folderId);
-                            if (result === 'duplicate') { toast(`"${n.name}" already exists in target folder`, 'error'); return; }
-                            if (result === 'cycle') { toast(`Cannot move "${n.name}" into itself or a subfolder`, 'error'); return; }
-                            if (result !== 'ok') { return; }
-                            const sp = startPosMap[id];
-                            const offX = sp && mainSp ? sp.x - mainSp.x : 0;
-                            const offY = sp && mainSp ? sp.y - mainSp.y : 0;
-                            const snapped = _snapFreeCell(dropPosX + offX, dropPosY + offY, occupied);
-                            VFS.setPos(winTarget.folderId, id, snapped.x, snapped.y);
-                            const cx = Math.round((snapped.x - 8) / GRID_X), cy = Math.round((snapped.y - 8) / GRID_Y);
-                            occupied.set(`${cx}_${cy}`, id);
-                            movedIds.push(id);
-                        });
-                        // Remove moved icons from desktop DOM and move selection
-                        winTarget._clearSelection();
-                        movedIds.forEach(id => {
-                            this._sel.delete(id);
-                            winTarget.selection.add(id);
-                            area.querySelector(`:scope > .file-item[data-id="${id}"]`)?.remove();
-                        });
-                        // Snap back items that failed to move (cycle/duplicate) to their start positions
-                        this._sel.forEach(id => {
-                            const item = document.querySelector(`#desktop-area > .file-item[data-id="${id}"]`);
-                            const sp = startPosMap[id];
-                            if (item && sp) {
-                                item.style.transition = 'left 0.12s ease, top 0.12s ease';
-                                item.style.left = sp.x + 'px'; item.style.top = sp.y + 'px';
-                                setTimeout(() => { if (item.parentNode) item.style.transition = ''; }, 150);
-                            }
-                        });
-                        this._updateSelectionBar();
-                        this.updateTaskbar();
-                        await saveVFS();
-                        winTarget.render();
-                        return;
-                    }
-                }
-                if (hoverFolder) {
-                    // Pre-check: verify no cycles before moving anything
-                    const cycled = [];
-                    this._sel.forEach(id => {
-                        if (id === hoverFolder) return;
-                        if (VFS.wouldCycle(id, hoverFolder)) cycled.push(VFS.node(id)?.name || id);
-                    });
-                    if (cycled.length) {
-                        this._sel.forEach(id => {
-                            const item = document.querySelector(`#desktop-area > .file-item[data-id="${id}"]`);
-                            const sp = startPosMap[id];
-                            if (item && sp) {
-                                item.style.transition = 'left 0.12s ease, top 0.12s ease';
-                                item.style.left = sp.x + 'px'; item.style.top = sp.y + 'px';
-                                setTimeout(() => { if (item.parentNode) item.style.transition = ''; }, 150);
-                            }
-                        });
-                        toast(`Cannot move "${cycled[0]}" into itself or a subfolder`, 'error');
-                        return;
-                    }
-                    // Pre-check: verify no duplicate names before moving anything
-                    const targetChildren = VFS.children(hoverFolder);
-                    const existingNames = new Set(targetChildren.map(n => n.name.toLowerCase()));
-                    const conflicts = [];
-                    this._sel.forEach(id => {
-                        if (id === hoverFolder) return;
-                        const n = VFS.node(id); if (!n) return;
-                        if (existingNames.has(n.name.toLowerCase())) conflicts.push(n.name);
-                    });
-                    if (conflicts.length) {
-                        // Snap items back to their original positions
-                        this._sel.forEach(id => {
-                            const item = document.querySelector(`#desktop-area > .file-item[data-id="${id}"]`);
-                            const sp = startPosMap[id];
-                            if (item && sp) {
-                                item.style.transition = 'left 0.12s ease, top 0.12s ease';
-                                item.style.left = sp.x + 'px'; item.style.top = sp.y + 'px';
-                                setTimeout(() => { if (item.parentNode) item.style.transition = ''; }, 150);
-                            }
-                        });
-                        toast(`Cannot move: "${conflicts[0]}" already exists in "${VFS.node(hoverFolder)?.name}"`, 'error');
-                        return;
-                    }
-                    const movedIds = [];
-                    this._sel.forEach(id => {
-                        if (id === hoverFolder) return;
-                        const n = VFS.node(id); if (!n) return;
-                        const result = VFS.move(id, hoverFolder);
-                        if (result === 'duplicate') { toast(`"${n.name}" already exists in "${VFS.node(hoverFolder)?.name}"`, 'error'); return; }
-                        if (result === 'cycle') { toast(`Cannot move "${n.name}" into itself or a subfolder`, 'error'); return; }
-                        if (result !== 'ok') { return; }
-                        movedIds.push(id);
-                    });
-                    // Remove moved icons from DOM and try to select in target window if open
-                    const targetWinForFolder = typeof WinManager !== 'undefined' ? WinManager._wins.find(w => w.folderId === hoverFolder) : null;
-                    if (targetWinForFolder) targetWinForFolder._clearSelection();
-
-                    movedIds.forEach(id => {
-                        this._sel.delete(id);
-                        if (targetWinForFolder) targetWinForFolder.selection.add(id);
-                        area.querySelector(`:scope > .file-item[data-id="${id}"]`)?.remove();
-                    });
-                    this._updateSelectionBar();
-                    this.updateTaskbar();
-                    await saveVFS();
-                    // Update any open window for the target folder
-                    if (typeof WinManager !== 'undefined') WinManager.renderAll();
-                } else {
-                    // Build map of currently-occupied cells (excluding dragged items)
-                    const occupied = new Map();
-                    VFS.children(this._desktopFolder).forEach(n => {
-                        if (this._sel.has(n.id)) return;
-                        const p = VFS.getPos(this._desktopFolder, n.id);
-                        if (p) occupied.set(`${Math.round((p.x - 8) / GRID_X)}_${Math.round((p.y - 8) / GRID_Y)}`, n.id);
-                    });
-
-                    this._sel.forEach(id => {
-                        const item = document.querySelector(`#desktop-area > .file-item[data-id="${id}"]`);
-                        if (!item) return;
-                        const rawX = parseInt(item.style.left), rawY = parseInt(item.style.top);
-                        const snapped = _snapFreeCell(rawX, rawY, occupied);
-                        const cx = Math.round((snapped.x - 8) / GRID_X);
-                        const cy = Math.round((snapped.y - 8) / GRID_Y);
-                        occupied.set(`${cx}_${cy}`, id);
-                        // Smooth animate to snapped position
-                        item.style.transition = 'left 0.12s ease, top 0.12s ease';
-                        item.style.left = snapped.x + 'px';
-                        item.style.top = snapped.y + 'px';
-                        setTimeout(() => { if (item.parentNode) item.style.transition = ''; }, 150);
-                        VFS.setPos(this._desktopFolder, id, snapped.x, snapped.y);
-                    });
-                    await saveVFS();
-                }
-            }
-        };
-
-        document.addEventListener('mousemove', onMove);
-        document.addEventListener('mouseup', onUp);
     },
+
 
     /* ---- Touch-drag for mobile: long-press (400ms) + drag icons ---- */
     _initTouchDrag(area) {
@@ -1934,544 +2090,16 @@ class FolderWindow {
     _onIconMousedown(e, el, node) {
         if (e.button !== 0) return;
         hideCtxMenu();
-        e.stopPropagation(); e.preventDefault();
-        _cancelHoverTooltip();
-
-        if (!e.ctrlKey && !e.metaKey && !this.selection.has(node.id)) {
-            this.selection.clear();
-            this.el.querySelectorAll('.fw-area > .file-item.selected').forEach(i => i.classList.remove('selected'));
-        }
-        this.selection.add(node.id);
-        el.classList.add('selected');
-        this._updateStatus();
-
-        const fwArea = this.el.querySelector('.fw-area');
-        fwArea.focus();
-        const startX = e.clientX, startY = e.clientY,
-            startScrollX = fwArea.scrollLeft, startScrollY = fwArea.scrollTop;
-        // Remember click offset within the icon for ghost positioning
-        const elRect = el.getBoundingClientRect(),
-            clickOffX = e.clientX - elRect.left,
-            clickOffY = e.clientY - elRect.top,
-            startPosMap = {};
-        this.selection.forEach(id => {
-            const item = fwArea.querySelector(`.file-item[data-id="${id}"]`);
-            if (item) startPosMap[id] = { x: parseInt(item.style.left), y: parseInt(item.style.top) };
-        });
-        // Build occupied map for snap preview (exclude dragged items)
-        const fwOccupiedAtStart = new Map();
-        VFS.children(this.folderId).forEach(n => {
-            if (this.selection.has(n.id)) return;
-            const p = VFS.getPos(this.folderId, n.id);
-            if (p) fwOccupiedAtStart.set(`${Math.round((p.x - 8) / GRID_X)}_${Math.round((p.y - 8) / GRID_Y)}`, n.id);
-        });
-        let snapPreviewEls = [],
-            deskSnapPreviewEls = [], // snap previews on desktop when dragging out of window
-            winSnapPreviewEls = [],  // snap previews inside a target folder window
-            moved = false, escaped = false, hoverFolder = null, hoverWin = null;
-        // Ghost clones placed in desktop-area when dragging outside fw
-        let ghostEls = [];
-
-        const fwRect = () => this.el.getBoundingClientRect();
-
-        const onMove = mv => {
-            const r = fwRect(),
-                fwAreaRect = fwArea.getBoundingClientRect(),
-                mainPos = startPosMap[node.id],
-                targetMainX = mv.clientX - fwAreaRect.left + fwArea.scrollLeft - clickOffX,
-                targetMainY = mv.clientY - fwAreaRect.top + fwArea.scrollTop - clickOffY,
-                dx = targetMainX - mainPos.x,
-                dy = targetMainY - mainPos.y;
-            if (!moved && Math.abs(mv.clientX - startX) + Math.abs(mv.clientY - startY) > 4) {
-                moved = true; _isDragging = true; _cancelHoverTooltip();
-            }
-            const outsideWindow = mv.clientX < r.left || mv.clientX > r.right ||
-                mv.clientY < r.top || mv.clientY > r.bottom;
-
-            // Re-enter source window: cancel escape, remove ghosts, restore originals
-            if (!outsideWindow && escaped) {
-                escaped = false;
-                ghostEls.forEach(g => g.remove());
-                ghostEls = [];
-                deskSnapPreviewEls.forEach(p => p.remove()); deskSnapPreviewEls = [];
-                this.selection.forEach(id => {
-                    const orig = fwArea.querySelector(`.file-item[data-id="${id}"]`);
-                    if (orig) orig.style.visibility = '';
-                });
-            }
-
-            if (outsideWindow && !escaped) {
-                // Escape from window: hide originals, create ghost clones in desktop-area
-                escaped = true;
-                this.selection.forEach(id => {
-                    const orig = fwArea.querySelector(`.file-item[data-id="${id}"]`);
-                    if (orig) orig.style.visibility = 'hidden';
-                });
-                const deskArea = document.getElementById('desktop-area');
-                const selIds = [...this.selection];
-                // First ghost = clicked item, positioned exactly under cursor
-                selIds.sort((a, b) => (a === node.id ? -1 : b === node.id ? 1 : 0));
-                selIds.forEach((id, i) => {
-                    const n = VFS.node(id); if (!n) return;
-                    const ghost = _buildIconEl(n, { x: 0, y: 0 });
-                    ghost.classList.add('selected');
-                    ghost.style.position = 'absolute';
-                    ghost.style.zIndex = '7900';
-                    ghost.style.opacity = '0.7';
-                    ghost.style.pointerEvents = 'none';
-                    ghost.style.willChange = 'left, top';
-                    ghost.dataset.ghostFor = id;
-                    ghost.dataset.ghostIdx = String(i); // 0 = clicked item
-                    deskArea.appendChild(ghost);
-                    ghostEls.push(ghost);
-                });
-            }
-            if (!escaped) {
-                // Normal inner-window drag
-                this.selection.forEach(id => {
-                    const item = fwArea.querySelector(`.file-item[data-id="${id}"]`);
-                    const sp = startPosMap[id];
-                    if (item && sp) { item.style.left = (sp.x + dx) + 'px'; item.style.top = (sp.y + dy) + 'px'; }
-                });
-            }
-            if (escaped) {
-                // Position ghosts in desktop-area coordinates
-                // Clicked item follows cursor; others preserve relative layout
-                const deskArea = document.getElementById('desktop-area');
-                const deskRect = deskArea.getBoundingClientRect();
-                const baseX = mv.clientX - deskRect.left + deskArea.scrollLeft - clickOffX,
-                    baseY = mv.clientY - deskRect.top + deskArea.scrollTop - clickOffY,
-                    mainSp = startPosMap[node.id];
-                ghostEls.forEach(g => {
-                    const gid = g.dataset.ghostFor;
-                    const sp = startPosMap[gid];
-                    const offX = sp && mainSp ? sp.x - mainSp.x : 0;
-                    const offY = sp && mainSp ? sp.y - mainSp.y : 0;
-                    g.style.left = (baseX + offX) + 'px';
-                    g.style.top = (baseY + offY) + 'px';
-                });
-            }
-            // Highlight drop-target folder (in both window areas and desktop)
-            // Temporarily disable pointer events on dragged items so elementFromPoint can see through them
-            if (!escaped) {
-                this.selection.forEach(id => {
-                    const it = fwArea.querySelector(`.file-item[data-id="${id}"]`);
-                    if (it) it.style.pointerEvents = 'none';
-                });
-            }
-            const target = document.elementFromPoint(mv.clientX, mv.clientY);
-            if (!escaped) {
-                this.selection.forEach(id => {
-                    const it = fwArea.querySelector(`.file-item[data-id="${id}"]`);
-                    if (it) it.style.pointerEvents = '';
-                });
-            }
-            const folderEl = target?.closest('.file-item[data-id]');
-            const newHover = folderEl && !this.selection.has(folderEl.dataset.id) &&
-                VFS.node(folderEl.dataset.id)?.type === 'folder' ? folderEl.dataset.id : null;
-            if (newHover !== hoverFolder) {
-                if (hoverFolder) document.querySelectorAll(`.file-item[data-id="${hoverFolder}"]`).forEach(el => el.classList.remove('drag-target'));
-                hoverFolder = newHover;
-                if (hoverFolder) document.querySelectorAll(`.file-item[data-id="${hoverFolder}"]`).forEach(el => el.classList.add('drag-target'));
-            }
-
-            const fwElt = !hoverFolder ? target?.closest('.folder-window') : null;
-            const curWin = fwElt ? (typeof WinManager !== 'undefined' ? WinManager._wins.find(w => w.el === fwElt) : null) : null;
-            if (curWin !== hoverWin) {
-                winSnapPreviewEls.forEach(p => p.remove()); winSnapPreviewEls = [];
-                hoverWin = curWin;
-            }
-
-            // Snap preview: within window when not escaped, on desktop when escaped
-            if (!escaped && moved) {
-                if (hoverFolder) {
-                    snapPreviewEls.forEach(p => p.style.display = 'none');
-                } else {
-                    const mainSp = startPosMap[node.id];
-                    if (mainSp) {
-                        const mainSnapped = _snapFreeCell(mainSp.x + dx, mainSp.y + dy, fwOccupiedAtStart);
-                        const selIds = [...this.selection];
-                        while (snapPreviewEls.length < selIds.length) {
-                            const pEl = document.createElement('div'); pEl.className = 'snap-preview';
-                            fwArea.appendChild(pEl); snapPreviewEls.push(pEl);
-                        }
-                        while (snapPreviewEls.length > selIds.length) { snapPreviewEls.pop().remove(); }
-                        selIds.forEach((id, i) => {
-                            const sp = startPosMap[id]; if (!sp) return;
-                            const offX = Math.round((sp.x - mainSp.x) / GRID_X) * GRID_X;
-                            const offY = Math.round((sp.y - mainSp.y) / GRID_Y) * GRID_Y;
-                            snapPreviewEls[i].style.left = (mainSnapped.x + offX) + 'px';
-                            snapPreviewEls[i].style.top = (mainSnapped.y + offY) + 'px';
-                            snapPreviewEls[i].style.display = '';
-                        });
-                    }
-                }
-            } else if (escaped && moved) {
-                // Show snap preview on desktop while dragging out of window
-                snapPreviewEls.forEach(p => p.style.display = 'none');
-                if (hoverFolder) {
-                    deskSnapPreviewEls.forEach(p => p.style.display = 'none');
-                    winSnapPreviewEls.forEach(p => p.style.display = 'none');
-                } else if (hoverWin && hoverWin !== this) {
-                    deskSnapPreviewEls.forEach(p => p.style.display = 'none');
-                    const winArea = hoverWin.el.querySelector('.fw-area');
-                    const winRect = winArea.getBoundingClientRect();
-                    const dropX = mv.clientX - winRect.left + winArea.scrollLeft - clickOffX;
-                    const dropY = mv.clientY - winRect.top + winArea.scrollTop - clickOffY;
-                    const winOcc = new Map();
-                    VFS.children(hoverWin.folderId).forEach(n => {
-                        const p = VFS.getPos(hoverWin.folderId, n.id);
-                        if (p) winOcc.set(`${Math.round((p.x - 8) / GRID_X)}_${Math.round((p.y - 8) / GRID_Y)}`, n.id);
-                    });
-                    const selIds = [...this.selection];
-                    while (winSnapPreviewEls.length < selIds.length) {
-                        const pEl = document.createElement('div'); pEl.className = 'snap-preview';
-                        winArea.appendChild(pEl); winSnapPreviewEls.push(pEl);
-                    }
-                    while (winSnapPreviewEls.length > selIds.length) { winSnapPreviewEls.pop().remove(); }
-                    const snapOcc = new Map(winOcc);
-                    const mainSp = startPosMap[node.id];
-                    selIds.forEach((id, i) => {
-                        const sp = startPosMap[id];
-                        const offX = sp && mainSp ? sp.x - mainSp.x : 0;
-                        const offY = sp && mainSp ? sp.y - mainSp.y : 0;
-                        const snapped = _snapFreeCell(dropX + offX, dropY + offY, snapOcc);
-                        const cx = Math.round((snapped.x - 8) / GRID_X), cy = Math.round((snapped.y - 8) / GRID_Y);
-                        snapOcc.set(`${cx}_${cy}`, id);
-                        winSnapPreviewEls[i].style.left = snapped.x + 'px';
-                        winSnapPreviewEls[i].style.top = snapped.y + 'px';
-                        winSnapPreviewEls[i].style.display = '';
-                    });
-                } else {
-                    winSnapPreviewEls.forEach(p => p.style.display = 'none');
-                    const deskArea = document.getElementById('desktop-area'),
-                        deskRect = deskArea.getBoundingClientRect(),
-                        baseDropX = mv.clientX - deskRect.left + deskArea.scrollLeft - clickOffX,
-                        baseDropY = mv.clientY - deskRect.top + deskArea.scrollTop - clickOffY,
-                        _deskFidSnap = Desktop._desktopFolder,
-                        deskOcc = new Map();
-                    VFS.children(_deskFidSnap).forEach(n => {
-                        const p = VFS.getPos(_deskFidSnap, n.id);
-                        if (p) deskOcc.set(`${Math.round((p.x - 8) / GRID_X)}_${Math.round((p.y - 8) / GRID_Y)}`, n.id);
-                    });
-                    // Each item gets its own nearest free cell sequentially based on relative distance
-                    const selIds = [...this.selection];
-                    while (deskSnapPreviewEls.length < selIds.length) {
-                        const pEl = document.createElement('div'); pEl.className = 'snap-preview';
-                        deskArea.appendChild(pEl); deskSnapPreviewEls.push(pEl);
-                    }
-                    while (deskSnapPreviewEls.length > selIds.length) { deskSnapPreviewEls.pop().remove(); }
-                    const tempOcc = new Map(deskOcc);
-                    const mainSp = startPosMap[node.id];
-                    selIds.forEach((id, i) => {
-                        const sp = startPosMap[id];
-                        const offX = sp && mainSp ? sp.x - mainSp.x : 0;
-                        const offY = sp && mainSp ? sp.y - mainSp.y : 0;
-                        const snapped = _snapFreeCell(
-                            baseDropX + offX,
-                            baseDropY + offY,
-                            tempOcc
-                        );
-                        deskSnapPreviewEls[i].style.left = snapped.x + 'px';
-                        deskSnapPreviewEls[i].style.top = snapped.y + 'px';
-                        deskSnapPreviewEls[i].style.display = '';
-                        // Mark cell as occupied so next item doesn't overlap
-                        const cx = Math.round((snapped.x - 8) / GRID_X), cy = Math.round((snapped.y - 8) / GRID_Y);
-                        tempOcc.set(`${cx}_${cy}`, id);
-                    });
-                }
-            }
-        };
-
-        const onUp = async () => {
-            document.removeEventListener('mousemove', onMove);
-            document.removeEventListener('mouseup', onUp);
-            _isDragging = false;
-            snapPreviewEls.forEach(p => p.remove()); snapPreviewEls = [];
-            deskSnapPreviewEls.forEach(p => p.remove()); deskSnapPreviewEls = [];
-            winSnapPreviewEls.forEach(p => p.remove()); winSnapPreviewEls = [];
-            if (hoverFolder) document.querySelectorAll(`.file-item[data-id="${hoverFolder}"]`).forEach(el => el.classList.remove('drag-target'));
-            // Remove ghosts
-            ghostEls.forEach(g => g.remove());
-            ghostEls = [];
-
-            if (!moved) {
-                // Restore visibility on no-move (just a click)
-                this.selection.forEach(id => {
-                    const orig = fwArea.querySelector(`.file-item[data-id="${id}"]`);
-                    if (orig) orig.style.visibility = '';
-                });
-                return;
-            }
-
-            const isChangingFolder = escaped;
-            let blocked = null;
-            if (isChangingFolder && typeof WinManager !== 'undefined') {
-                const dropT = document.elementFromPoint(_lastFwDragX, _lastFwDragY);
-                const tfw = dropT?.closest('.folder-window');
-                const tw = tfw ? WinManager._wins.find(w => w.el === tfw) : null;
-                const srcRect = fwRect();
-                const actuallyEscaped = !(_lastFwDragX >= srcRect.left && _lastFwDragX <= srcRect.right && _lastFwDragY >= srcRect.top && _lastFwDragY <= srcRect.bottom);
-
-                // If it really escaped and not just dropped back into the same folder window
-                if (actuallyEscaped && !(tw === this)) {
-                    const openFolderIds = new Set();
-                    WinManager._wins.forEach(w => {
-                        let cur = w.folderId;
-                        while (cur && cur !== 'root') { openFolderIds.add(cur); cur = (VFS.node(cur) || {}).parentId; }
-                    });
-                    // Determine drop target to avoid pre-empting cycle errors
-                    const _targetFId2 = tw ? tw.folderId : null;
-                    blocked = Array.from(this.selection).find(id => {
-                        const n = VFS.node(id);
-                        if (!n || n.type !== 'folder' || !openFolderIds.has(id)) return false;
-                        if (_targetFId2 && VFS.wouldCycle(id, _targetFId2)) return false;
-                        return true;
-                    });
-                }
-            }
-
-            if (blocked) {
-                this.selection.forEach(id => {
-                    const orig = fwArea.querySelector(`.file-item[data-id="${id}"]`);
-                    const sp = startPosMap[id];
-                    if (orig) {
-                        orig.style.visibility = '';
-                        if (sp && !escaped) {
-                            orig.style.transition = 'left 0.12s ease, top 0.12s ease';
-                            orig.style.left = sp.x + 'px'; orig.style.top = sp.y + 'px';
-                            setTimeout(() => { if (orig.parentNode) orig.style.transition = ''; }, 150);
-                        }
-                    }
-                });
-                toast(`“${VFS.node(blocked)?.name}” is open in Explorer — close the window first`, 'error');
-                return;
-            }
-
-            if (escaped) {
-                // Re-validate: if cursor ended inside source window, cancel drop (race between mouseup/mousemove)
-                const srcR = fwRect();
-                if (_lastFwDragX >= srcR.left && _lastFwDragX <= srcR.right &&
-                    _lastFwDragY >= srcR.top && _lastFwDragY <= srcR.bottom) {
-                    this.selection.forEach(id => {
-                        const orig = fwArea.querySelector(`.file-item[data-id="${id}"]`);
-                        if (orig) orig.style.visibility = '';
-                    });
-                    return;
-                }
-                // Dropped outside this window
-                const dropTarget = document.elementFromPoint(_lastFwDragX, _lastFwDragY);
-                const targetFw = dropTarget?.closest('.folder-window');
-                const targetWin = targetFw ? WinManager._wins.find(w => w.el === targetFw) : null;
-
-                if (targetWin && targetWin !== this) {
-                    // Drop into another folder window
-                    const targetArea = targetWin.el.querySelector('.fw-area');
-                    const tRect = targetArea.getBoundingClientRect();
-                    const dropPosX = _lastFwDragX - tRect.left + targetArea.scrollLeft - clickOffX;
-                    const dropPosY = _lastFwDragY - tRect.top + targetArea.scrollTop - clickOffY;
-                    const occupied = new Map();
-                    VFS.children(targetWin.folderId).forEach(n => {
-                        const p = VFS.getPos(targetWin.folderId, n.id);
-                        if (p) occupied.set(`${Math.round((p.x - 8) / GRID_X)}_${Math.round((p.y - 8) / GRID_Y)}`, n.id);
-                    });
-                    // Each item gets its own nearest free cell sequentially based on relative distance
-                    const selIds2 = [...this.selection];
-                    const movedIds = [];
-                    const mainSp = startPosMap[node.id];
-                    selIds2.forEach((id, i) => {
-                        const n = VFS.node(id); if (!n) return;
-                        const result = VFS.move(id, targetWin.folderId);
-                        if (result === 'duplicate') { toast(`"${n.name}" already exists in target folder`, 'error'); return; }
-                        if (result === 'cycle') { toast(`Cannot move "${n.name}" into itself or a subfolder`, 'error'); return; }
-                        if (result !== 'ok') { return; }
-                        const sp = startPosMap[id];
-                        const offX = sp && mainSp ? sp.x - mainSp.x : 0;
-                        const offY = sp && mainSp ? sp.y - mainSp.y : 0;
-                        const snapped = _snapFreeCell(
-                            dropPosX + offX,
-                            dropPosY + offY,
-                            occupied
-                        );
-                        VFS.setPos(targetWin.folderId, id, snapped.x, snapped.y);
-                        const cx = Math.round((snapped.x - 8) / GRID_X), cy = Math.round((snapped.y - 8) / GRID_Y);
-                        occupied.set(`${cx}_${cy}`, id);
-                        movedIds.push(id);
-                    });
-                    // Remove moved items from source window DOM (no full re-render = no flash)
-                    targetWin._clearSelection();
-                    movedIds.forEach(id => {
-                        this.selection.delete(id);
-                        targetWin.selection.add(id);
-                        const orig = fwArea.querySelector(`.file-item[data-id="${id}"]`);
-                        if (orig) orig.remove();
-                    });
-                    // Restore visibility for items that failed to move (duplicates)
-                    this.selection.forEach(id => {
-                        const orig = fwArea.querySelector(`.file-item[data-id="${id}"]`);
-                        if (orig) orig.style.visibility = '';
-                    });
-                    this._updateStatus();
-                    await saveVFS();
-                    targetWin.render();
-                } else if (hoverFolder) {
-                    // Drop onto a folder icon
-                    const movedIds = [];
-                    this.selection.forEach(id => {
-                        if (id === hoverFolder) return;
-                        const n = VFS.node(id); if (!n) return;
-                        const result = VFS.move(id, hoverFolder);
-                        if (result === 'duplicate') { toast(`"${n.name}" already exists in "${VFS.node(hoverFolder)?.name}"`, 'error'); return; }
-                        if (result === 'cycle') { toast(`Cannot move "${n.name}" into itself or a subfolder`, 'error'); return; }
-                        if (result !== 'ok') { return; }
-                        movedIds.push(id);
-                    });
-                    const targetWinForFolder = typeof WinManager !== 'undefined' ? WinManager._wins.find(w => w.folderId === hoverFolder) : null;
-                    if (targetWinForFolder) targetWinForFolder._clearSelection();
-                    movedIds.forEach(id => {
-                        this.selection.delete(id);
-                        if (targetWinForFolder) targetWinForFolder.selection.add(id);
-                        const orig = fwArea.querySelector(`.file-item[data-id="${id}"]`);
-                        if (orig) orig.remove();
-                    });
-                    this.selection.forEach(id => {
-                        const orig = fwArea.querySelector(`.file-item[data-id="${id}"]`);
-                        if (orig) orig.style.visibility = '';
-                    });
-                    this._updateStatus();
-                    await saveVFS();
-                    if (typeof WinManager !== 'undefined') WinManager.renderAll();
-                } else {
-                    // Drop onto desktop
-                    const deskArea = document.getElementById('desktop-area'),
-                        deskRect = deskArea.getBoundingClientRect(),
-                        dropPosX = _lastFwDragX - deskRect.left + deskArea.scrollLeft - clickOffX,
-                        dropPosY = _lastFwDragY - deskRect.top + deskArea.scrollTop - clickOffY,
-                        deskFid = Desktop._desktopFolder,
-                        occupied = new Map();
-                    VFS.children(deskFid).forEach(n => {
-                        const p = VFS.getPos(deskFid, n.id);
-                        if (p) occupied.set(`${Math.round((p.x - 8) / GRID_X)}_${Math.round((p.y - 8) / GRID_Y)}`, n.id);
-                    });
-                    // Each item gets its own nearest free cell sequentially based on relative distance
-                    const selIds = [...this.selection];
-                    const movedIds = [];
-                    const mainSp = startPosMap[node.id];
-                    selIds.forEach((id, i) => {
-                        const n = VFS.node(id); if (!n) return;
-                        const result = VFS.move(id, deskFid);
-                        if (result === 'duplicate') { toast(`"${n.name}" already exists on desktop`, 'error'); return; }
-                        if (result === 'cycle') { toast(`Cannot move "${n.name}" into itself or a subfolder`, 'error'); return; }
-                        const sp = startPosMap[id];
-                        const offX = sp && mainSp ? sp.x - mainSp.x : 0;
-                        const offY = sp && mainSp ? sp.y - mainSp.y : 0;
-                        const snapped = _snapFreeCell(
-                            dropPosX + offX,
-                            dropPosY + offY,
-                            occupied
-                        );
-                        VFS.setPos(deskFid, id, snapped.x, snapped.y);
-                        const cx = Math.round((snapped.x - 8) / GRID_X), cy = Math.round((snapped.y - 8) / GRID_Y);
-                        occupied.set(`${cx}_${cy}`, id);
-                        movedIds.push(id);
-                    });
-                    Desktop._sel.clear();
-                    document.querySelectorAll('#desktop-area > .file-item.selected').forEach(i => i.classList.remove('selected'));
-                    movedIds.forEach(id => {
-                        this.selection.delete(id);
-                        Desktop._sel.add(id);
-                        const orig = fwArea.querySelector(`.file-item[data-id="${id}"]`);
-                        if (orig) orig.remove();
-                    });
-                    // Restore visibility & snap back items that failed (duplicate/cycle)
-                    this.selection.forEach(id => {
-                        const orig = fwArea.querySelector(`.file-item[data-id="${id}"]`);
-                        if (orig) {
-                            orig.style.visibility = '';
-                            const sp = startPosMap[id];
-                            if (sp) {
-                                orig.style.transition = 'left 0.15s ease, top 0.15s ease';
-                                orig.style.left = sp.x + 'px'; orig.style.top = sp.y + 'px';
-                                setTimeout(() => { if (orig.parentNode) orig.style.transition = ''; }, 160);
-                            }
-                        }
-                    });
-                    this._updateStatus();
-                    await saveVFS();
-                    Desktop._patchIcons();
-                }
-                return;
-            }
-
-            // Restore visibility (non-escaped path)
-            this.selection.forEach(id => {
-                const orig = fwArea.querySelector(`.file-item[data-id="${id}"]`);
-                if (orig) orig.style.visibility = '';
-            });
-
-            // Normal within-window drop
-            if (hoverFolder) {
-                const movedIds = [];
-                this.selection.forEach(id => {
-                    if (id === hoverFolder) return;
-                    const n = VFS.node(id); if (!n) return;
-                    const result = VFS.move(id, hoverFolder);
-                    if (result === 'duplicate') { toast(`"${n.name}" already exists in "${VFS.node(hoverFolder)?.name}"`, 'error'); return; }
-                    if (result === 'cycle') { toast(`Cannot move "${n.name}" into itself or a subfolder`, 'error'); return; }
-                    if (result !== 'ok') { return; }
-                    movedIds.push(id);
-                });
-                // Snap items that failed to move back to their VFS positions
-                this.selection.forEach(id => {
-                    const item = fwArea.querySelector(`.file-item[data-id="${id}"]`);
-                    const pos = VFS.getPos(this.folderId, id);
-                    if (item && pos) {
-                        item.style.transition = 'left 0.12s ease, top 0.12s ease';
-                        item.style.left = pos.x + 'px'; item.style.top = pos.y + 'px';
-                        setTimeout(() => { if (item.parentNode) item.style.transition = ''; }, 150);
-                    }
-                });
-                movedIds.forEach(id => { this.selection.delete(id); });
-                await saveVFS();
-                this.render();
-                if (typeof WinManager !== 'undefined') WinManager.renderAll();
-            } else {
-                // Grid snap
-                const occupied = new Map();
-                VFS.children(this.folderId).forEach(n => {
-                    if (this.selection.has(n.id)) return;
-                    const p = VFS.getPos(this.folderId, n.id);
-                    if (p) occupied.set(`${Math.round((p.x - 8) / GRID_X)}_${Math.round((p.y - 8) / GRID_Y)}`, n.id);
-                });
-                this.selection.forEach(id => {
-                    const item = fwArea.querySelector(`.file-item[data-id="${id}"]`);
-                    if (!item) return;
-                    const rawX = parseInt(item.style.left), rawY = parseInt(item.style.top);
-                    const snapped = _snapFreeCell(rawX, rawY, occupied);
-                    const cx = Math.round((snapped.x - 8) / GRID_X), cy = Math.round((snapped.y - 8) / GRID_Y);
-                    occupied.set(`${cx}_${cy}`, id);
-                    item.style.transition = 'left 0.12s ease, top 0.12s ease';
-                    item.style.left = snapped.x + 'px'; item.style.top = snapped.y + 'px';
-                    setTimeout(() => { if (item.parentNode) item.style.transition = ''; }, 150);
-                    VFS.setPos(this.folderId, id, snapped.x, snapped.y);
-                });
-                await saveVFS();
-            }
-        };
-
-        // Track last mouse position for use in onUp
-        let _lastFwDragX = e.clientX, _lastFwDragY = e.clientY;
-        const _trackMove = mv => { _lastFwDragX = mv.clientX; _lastFwDragY = mv.clientY; };
-        const origOnMove = onMove,
-            wrappedOnMove = mv => { _trackMove(mv); origOnMove(mv); };
-
-        document.addEventListener('mousemove', wrappedOnMove);
-        document.addEventListener('mouseup', function cleanup(ev) {
-            document.removeEventListener('mousemove', wrappedOnMove);
-            document.removeEventListener('mouseup', cleanup);
-            // Update last position from mouseup event
-            _lastFwDragX = ev.clientX; _lastFwDragY = ev.clientY;
-            onUp();
+        _startIconDrag(e, node, el, {
+            area:      this.el.querySelector('.fw-area'),
+            folderId:  this.folderId,
+            selection: this.selection,
+            winEl:     this.el,
+            updateUI:  () => this._updateStatus(),
+            clearAll:  () => {
+                this.selection.clear();
+                this.el.querySelectorAll('.fw-area > .file-item.selected').forEach(i => i.classList.remove('selected'));
+            },
         });
     }
 
