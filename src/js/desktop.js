@@ -1974,19 +1974,24 @@ class FolderWindow {
 
         div.addEventListener('mousedown', e => this._onIconMousedown(e, div, node));
         div.addEventListener('dblclick', e => { e.stopPropagation(); this._openNode(node); });
-        div.addEventListener('contextmenu', e => { e.preventDefault(); if (_touchDragActive) return; e.stopPropagation(); this._ctxIcon(e, node); });
+        // _isTouchEvent stays true from touchstart → 500ms after touchend, so any browser-generated
+        // contextmenu event from OS long-press is suppressed (we use our own tap-based context menu).
+        let _isTouchEvent = false;
+        div.addEventListener('contextmenu', e => { e.preventDefault(); if (_touchDragActive || _isTouchEvent) return; e.stopPropagation(); this._ctxIcon(e, node); });
         // Mobile: single tap → context menu, double tap → open
         {
             let _ts = 0, _tm = false, _lastTap = 0;
-            div.addEventListener('touchstart', () => { _ts = Date.now(); _tm = false; _cancelHoverTooltip(); }, { passive: true });
+            div.addEventListener('touchstart', () => { _ts = Date.now(); _tm = false; _isTouchEvent = true; _cancelHoverTooltip(); }, { passive: true });
             div.addEventListener('touchmove', () => { _tm = true; }, { passive: true });
             div.addEventListener('touchend', e => {
+                setTimeout(() => { _isTouchEvent = false; }, 500);
                 if (_tm || Date.now() - _ts > 350) return;
                 e.preventDefault();
                 const now = Date.now(), t = e.changedTouches[0];
                 if (now - _lastTap < 300) { _lastTap = 0; this._openNode(node); }
                 else { _lastTap = now; this._ctxIcon({ clientX: t.clientX, clientY: t.clientY, ctrlKey: false, metaKey: false, preventDefault() { }, stopPropagation() { } }, node); }
             });
+            div.addEventListener('touchcancel', () => { _isTouchEvent = false; }, { passive: true });
         }
         return div;
     }
@@ -2436,6 +2441,8 @@ class FolderWindow {
                         occupied.set(`${cx}_${cy}`, id);
                         movedIds.push(id);
                     });
+                    Desktop._sel.clear();
+                    document.querySelectorAll('#desktop-area > .file-item.selected').forEach(i => i.classList.remove('selected'));
                     movedIds.forEach(id => {
                         this.selection.delete(id);
                         Desktop._sel.add(id);
