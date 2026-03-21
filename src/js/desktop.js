@@ -687,8 +687,281 @@ function openSettings() {
             Overlay.show('modal-settings');
         };
     };
+    // ── File System check — opens scanner modal ────────────────
+    document.getElementById('fs-check-open').onclick = () => {
+        Overlay.hide();
+        _openScannerModal();
+    };
     Overlay.show('modal-settings');
 }
+
+/* ============================================================
+   CONTAINER INTEGRITY SCANNER MODAL
+   ============================================================ */
+const _SCAN_ICONS = {
+    pass: '<svg width="14" height="14" viewBox="0 0 16 16" fill="none"><path d="M4 8l3 3 5-6" stroke="currentColor" stroke-width="1.6" stroke-linecap="square" stroke-linejoin="round"/></svg>',
+    fail: '<svg width="14" height="14" viewBox="0 0 16 16" fill="none"><path d="M4 4l8 8M12 4l-8 8" stroke="currentColor" stroke-width="1.5" stroke-linecap="square"/></svg>',
+    warn: '<svg width="14" height="14" viewBox="0 0 16 16" fill="none"><path d="M8 3v6M8 11.5v1" stroke="currentColor" stroke-width="1.5" stroke-linecap="square"/></svg>',
+    spin: '<div class="spinner"></div>',
+};
+
+function _delay(ms) { return new Promise(r => setTimeout(r, ms)); }
+
+function _addScanRow(log, name) {
+    const row = document.createElement('div');
+    row.className = 'scanner-step';
+    row.innerHTML = `<span class="scanner-step-icon">${_SCAN_ICONS.spin}</span><span class="scanner-step-label">${escHtml(name)}</span><span class="scanner-step-result">…</span>`;
+    log.appendChild(row);
+    log.scrollTop = log.scrollHeight;
+    return row;
+}
+
+function _resolveScanRow(row, status, detail) {
+    row.classList.add(status);
+    row.querySelector('.scanner-step-icon').innerHTML = _SCAN_ICONS[status] || _SCAN_ICONS.pass;
+    row.querySelector('.scanner-step-result').textContent = detail;
+}
+
+/* --- Async DB-level checks (file data, IVs, orphan records, size consistency) --- */
+async function _runDbChecks(repair) {
+    const steps = [];
+    function mkStep(name, iss, fxd) {
+        const hasCrit = iss.some(i => i.sev === 'critical');
+        const status = iss.length === 0 ? 'pass' : hasCrit ? 'fail' : 'warn';
+        const detail = iss.length === 0 ? 'OK' : `${iss.length} issue${iss.length !== 1 ? 's' : ''}${repair && fxd.length ? `, ${fxd.length} fixed` : ''}`;
+        steps.push({ name, status, detail, issues: iss, fixed: fxd });
+    }
+
+    let vfsFileIds = new Set(VFS.fileIds());
+    const allDbFiles = await DB.getFilesByCid(App.container.id);
+    const dbFileMap = new Map(allDbFiles.map(f => [f.id, f]));
+
+    // 1. File data existence — every VFS file node must have a matching DB record
+    {
+        const issues = [], fixed = [];
+        for (const id of vfsFileIds) {
+            const node = VFS.node(id);
+            if (!dbFileMap.has(id)) {
+                issues.push({ sev: 'critical', msg: `"${node?.name || id}": encrypted data not found in storage` });
+                if (repair) {
+                    VFS.remove(id);
+                    vfsFileIds.delete(id);
+                    fixed.push(`Removed broken file node "${node?.name || id}"`);
+                }
+            }
+        }
+        mkStep('File data existence', issues, fixed);
+    }
+
+    // 2. Encryption IV integrity — files with missing/broken IVs cannot be decrypted
+    //    Repair: purge unrecoverable file from VFS and DB (data is lost)
+    {
+        const issues = [], fixed = [];
+        for (const [id, rec] of dbFileMap) {
+            if (!vfsFileIds.has(id)) continue;
+            const node = VFS.node(id);
+            const broken = !rec.iv || !(rec.iv instanceof Uint8Array || rec.iv instanceof ArrayBuffer || ArrayBuffer.isView(rec.iv));
+            if (broken) {
+                issues.push({ sev: 'critical', msg: `"${node?.name || id}": ${!rec.iv ? 'missing' : 'invalid'} encryption IV` });
+                if (repair) {
+                    VFS.remove(id);
+                    vfsFileIds.delete(id);
+                    await DB.deleteFile(id);
+                    fixed.push(`Purged unrecoverable file "${node?.name || id}"`);
+                }
+            }
+        }
+        mkStep('Encryption IV integrity', issues, fixed);
+    }
+
+    // 3. File blob integrity — sized files must have non-empty blob
+    //    Repair: remove the file node + DB record (cannot serve empty data)
+    {
+        const issues = [], fixed = [];
+        for (const [id, rec] of dbFileMap) {
+            if (!vfsFileIds.has(id)) continue;
+            const node = VFS.node(id);
+            if (!node) continue;
+            if (node.size > 0 && (!rec.blob || (rec.blob instanceof ArrayBuffer && rec.blob.byteLength === 0))) {
+                issues.push({ sev: 'warn', msg: `"${node.name || id}": expected ${node.size} bytes but blob is empty` });
+                if (repair) {
+                    VFS.remove(id);
+                    vfsFileIds.delete(id);
+                    await DB.deleteFile(id);
+                    fixed.push(`Purged empty-blob file "${node.name || id}"`);
+                }
+            }
+        }
+        mkStep('File blob integrity', issues, fixed);
+    }
+
+    // 4. Orphaned DB records — DB files not referenced by any VFS node
+    {
+        const issues = [], fixed = [];
+        const liveIds = new Set(VFS.fileIds());
+        for (const [id] of dbFileMap) {
+            if (!liveIds.has(id)) {
+                issues.push({ sev: 'warn', msg: `Orphaned DB record "${id}"` });
+                if (repair) {
+                    await DB.deleteFile(id);
+                    fixed.push(`Deleted orphaned DB record "${id}"`);
+                }
+            }
+        }
+        mkStep('Orphaned storage records', issues, fixed);
+    }
+
+    // 5. Dead folder cleanup — remove folders whose subtree has no recoverable files
+    {
+        const issues = [], fixed = [];
+        const liveIds = new Set(VFS.fileIds());
+        function hasLiveFile(fid) {
+            for (const child of VFS.children(fid)) {
+                if (child.type === 'file' && liveIds.has(child.id)) return true;
+                if (child.type === 'folder' && hasLiveFile(child.id)) return true;
+            }
+            return false;
+        }
+        // Gather all non-root folders bottom-up (deepest first → safe to remove)
+        function gatherBottomUp(fid) {
+            const out = [];
+            for (const child of VFS.children(fid)) {
+                if (child.type === 'folder') { out.push(...gatherBottomUp(child.id)); out.push(child.id); }
+            }
+            return out;
+        }
+        const allFolders = gatherBottomUp('root');
+        for (const fid of allFolders) {
+            if (!VFS.node(fid)) continue;
+            if (!hasLiveFile(fid)) {
+                const node = VFS.node(fid);
+                issues.push({ sev: 'warn', msg: `"${node?.name || fid}": no recoverable files in subtree` });
+                if (repair) { VFS.remove(fid); fixed.push(`Removed dead folder "${node?.name || fid}"`); }
+            }
+        }
+        mkStep('Dead folder cleanup', issues, fixed);
+    }
+
+    // 6. Container size consistency
+    {
+        const issues = [], fixed = [];
+        const vfsTotal = VFS.totalSize();
+        const containerTotal = App.container.totalSize || 0;
+        if (Math.abs(vfsTotal - containerTotal) > 1024) {
+            issues.push({ sev: 'warn', msg: `Container reports ${containerTotal} bytes but VFS sums to ${vfsTotal} bytes` });
+            if (repair) {
+                App.container.totalSize = vfsTotal;
+                await DB.saveContainer(App.container);
+                fixed.push(`Corrected container totalSize to ${vfsTotal}`);
+            }
+        }
+        mkStep('Container size consistency', issues, fixed);
+    }
+
+    return steps;
+}
+
+function _openScannerModal() {
+    const log = document.getElementById('scanner-log'),
+        summary = document.getElementById('scanner-summary'),
+        repairBtn = document.getElementById('scanner-repair'),
+        startBtn = document.getElementById('scanner-start'),
+        closeBtn = document.getElementById('scanner-close');
+
+    log.innerHTML = '';
+    summary.style.display = 'none';
+    repairBtn.style.display = 'none';
+    startBtn.style.display = '';
+    startBtn.disabled = false;
+    startBtn.textContent = 'Start Scan';
+    let _hasIssues = false;
+
+    startBtn.onclick = () => {
+        if (_hasIssues || startBtn.textContent === 'Done') {
+            Overlay.hide();
+            return;
+        }
+        startBtn.disabled = true;
+        startBtn.textContent = 'Scanning…';
+        repairBtn.style.display = 'none';
+        _runScanAnimated(false);
+    };
+    repairBtn.onclick = async () => {
+        repairBtn.style.display = 'none';
+        startBtn.style.display = 'none';
+        log.innerHTML = '';
+        summary.style.display = 'none';
+        await _runScanAnimated(true);
+    };
+    closeBtn.onclick = () => Overlay.hide();
+
+    async function _runScanAnimated(repair) {
+        log.innerHTML = '';
+        summary.style.display = 'none';
+        _hasIssues = false;
+
+        // Phase 1: VFS structural checks (synchronous)
+        const vfsSteps = VFS.check(repair);
+        for (const s of vfsSteps) {
+            const row = _addScanRow(log, s.name);
+            await _delay(60 + Math.random() * 40);
+            _resolveScanRow(row, s.status, s.detail);
+            log.scrollTop = log.scrollHeight;
+        }
+
+        // Phase 2: DB async checks (file data, IVs, orphans, size)
+        const dbCheckNames = [
+            'File data existence',
+            'Encryption IV integrity',
+            'File blob integrity',
+            'Orphaned storage records',
+            'Dead folder cleanup',
+            'Container size consistency',
+        ];
+        // Show spinning rows for all DB checks first
+        const dbRows = dbCheckNames.map(name => _addScanRow(log, name));
+        log.scrollTop = log.scrollHeight;
+
+        const dbSteps = await _runDbChecks(repair);
+        for (let i = 0; i < dbSteps.length; i++) {
+            await _delay(80 + Math.random() * 60);
+            _resolveScanRow(dbRows[i], dbSteps[i].status, dbSteps[i].detail);
+            log.scrollTop = log.scrollHeight;
+        }
+
+        // Combine all steps for summary
+        const allSteps = [...vfsSteps, ...dbSteps];
+        const totalIssues = allSteps.reduce((s, st) => s + st.issues.length, 0),
+            totalFixed = allSteps.reduce((s, st) => s + st.fixed.length, 0),
+            allPass = allSteps.every(s => s.status === 'pass');
+
+        summary.style.display = '';
+        if (repair && totalFixed > 0) {
+            summary.className = 'scanner-summary repaired';
+            summary.innerHTML = `<svg width="20" height="20" viewBox="0 0 16 16" fill="none"><path d="M4 8l3 3 5-6" stroke="currentColor" stroke-width="1.6" stroke-linecap="square" stroke-linejoin="round"/></svg>
+                <span class="scanner-summary-text"><strong>Repair complete.</strong> ${totalFixed} issue${totalFixed !== 1 ? 's' : ''} automatically resolved. Container integrity restored.</span>`;
+            await saveVFS();
+            Desktop.render();
+        } else if (allPass) {
+            summary.className = 'scanner-summary healthy';
+            summary.innerHTML = `<svg width="20" height="20" viewBox="0 0 24 26" fill="none"><path d="M12 3L3.5 7.5v4.5c0 5.2 3.6 10 8.5 11.5 4.9-1.5 8.5-6.3 8.5-11.5V7.5L12 3z" stroke="currentColor" stroke-width="1.5" fill="none"/><path d="M9 13l2.5 2.5 4-4.5" stroke="currentColor" stroke-width="1.6" stroke-linecap="square" stroke-linejoin="round"/></svg>
+                <span class="scanner-summary-text"><strong>All checks passed.</strong> Your container's virtual disk image and workspace environment are in perfect condition.</span>`;
+        } else {
+            summary.className = 'scanner-summary issues';
+            summary.innerHTML = `<svg width="20" height="20" viewBox="0 0 20 20" fill="none"><circle cx="10" cy="10" r="8.5" stroke="currentColor" stroke-width="1.4"/><path d="M10 5.5v5.5" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"/><circle cx="10" cy="14" r="0.9" fill="currentColor"/></svg>
+                <span class="scanner-summary-text"><strong>${totalIssues} issue${totalIssues !== 1 ? 's' : ''} detected.</strong> Automatic repair can resolve these problems without data loss.</span>`;
+            _hasIssues = true;
+            repairBtn.style.display = '';
+        }
+
+        startBtn.style.display = '';
+        startBtn.disabled = false;
+        startBtn.textContent = _hasIssues ? 'Done' : 'Done';
+    }
+
+    Overlay.show('modal-scanner');
+}
+
 
 const STATS_COLORS = ['#0078d4', '#e74856', '#16c60c', '#f9f1a5', '#b4009e', '#00b7c3', '#ff8c00', '#e3008c'];
 
@@ -958,7 +1231,8 @@ function _startIconDrag(e, node, el, srcCtx) {
     e.stopPropagation(); e.preventDefault();
     _cancelHoverTooltip();
 
-    if (!e.ctrlKey && !e.metaKey && !srcCtx.selection.has(node.id)) srcCtx.clearAll();
+    const wasSelected = srcCtx.selection.has(node.id);
+    if (!e.ctrlKey && !e.metaKey && !wasSelected) srcCtx.clearAll();
     srcCtx.selection.add(node.id);
     el.classList.add('selected');
     srcCtx.updateUI();
@@ -1264,6 +1538,12 @@ function _startIconDrag(e, node, el, srcCtx) {
         }
 
         if (!moved) {
+            // Ctrl+click on already-selected item → deselect it
+            if ((e.ctrlKey || e.metaKey) && wasSelected) {
+                srcCtx.selection.delete(node.id);
+                el.classList.remove('selected');
+                srcCtx.updateUI();
+            }
             // Click without drag — restore visibility for FW items
             if (!isDesktop) {
                 srcCtx.selection.forEach(id => {
@@ -1435,6 +1715,7 @@ function _startIconDrag(e, node, el, srcCtx) {
                     }
                 }
             });
+            if (movedIds.length) logActivity('move', `${movedIds.length} item${movedIds.length > 1 ? 's' : ''} → Desktop`, movedIds.length);
             srcCtx.updateUI();
             await saveVFS();
             Desktop._patchIcons();
@@ -1479,6 +1760,84 @@ function _startIconDrag(e, node, el, srcCtx) {
 }
 
 /* ============================================================
+   SHARED CONTEXT MENU BUILDERS — Desktop & FolderWindow
+   ============================================================ */
+function _buildSortSubmenu(sortTarget) {
+    return [
+        { label: 'By Name', icon: Icons.sortName, submenu: [
+            { label: 'A → Z', icon: Icons.sortAsc, action: () => sortIcons('name', 'asc', sortTarget) },
+            { label: 'Z → A', icon: Icons.sortDesc, action: () => sortIcons('name', 'desc', sortTarget) },
+        ]},
+        { label: 'By Date Modified', icon: Icons.sortDate, submenu: [
+            { label: 'Newest first', icon: Icons.sortDesc, action: () => sortIcons('mtime', 'desc', sortTarget) },
+            { label: 'Oldest first', icon: Icons.sortAsc, action: () => sortIcons('mtime', 'asc', sortTarget) },
+        ]},
+        { label: 'By Date Created', icon: Icons.sortDate, submenu: [
+            { label: 'Newest first', icon: Icons.sortDesc, action: () => sortIcons('ctime', 'desc', sortTarget) },
+            { label: 'Oldest first', icon: Icons.sortAsc, action: () => sortIcons('ctime', 'asc', sortTarget) },
+        ]},
+        { sep: true },
+        { label: 'By Size', icon: Icons.sortSize, submenu: [
+            { label: 'Largest first', icon: Icons.sortDesc, action: () => sortIcons('size', 'desc', sortTarget) },
+            { label: 'Smallest first', icon: Icons.sortAsc, action: () => sortIcons('size', 'asc', sortTarget) },
+        ]},
+        { sep: true },
+        { label: 'By Type', icon: Icons.sortType, action: () => sortIcons('type', 'asc', sortTarget) },
+    ];
+}
+
+function _buildAreaMenuItems(e, syncFn, sortTarget, refreshFn) {
+    const items = [
+        { label: 'New Text File', icon: Icons.newfile, action: () => { syncFn(); App._ctxScreenPos = { x: e.clientX, y: e.clientY }; newTextFile(); } },
+        { label: 'New Folder', icon: Icons.newfolder, action: () => { syncFn(); App._ctxScreenPos = { x: e.clientX, y: e.clientY }; newFolder(); } },
+        { sep: true },
+        { label: 'Import Files...', icon: Icons.upload, action: () => { syncFn(); document.getElementById('file-input').click(); } },
+    ];
+    if (App.clipboard) {
+        items.push({ sep: true });
+        items.push({ label: 'Paste', icon: Icons.paste, action: () => { syncFn(); pasteItems(); } });
+    }
+    items.push({ sep: true });
+    items.push({ label: 'Sort', icon: Icons.sort, submenu: _buildSortSubmenu(sortTarget) });
+    items.push({ sep: true });
+    items.push({ label: 'Refresh', icon: Icons.refresh, action: refreshFn });
+    return items;
+}
+
+function _buildIconMenuItems(node, sel, opts) {
+    const items = [];
+    if (node.type === 'folder') {
+        items.push({ label: 'Open', icon: Icons.open, action: () => opts.openFn(node) });
+        items.push({ label: 'Open in New Window', icon: Icons.newfolder, action: () => WinManager.open(node.id) });
+        items.push({
+            label: 'Folder Color', icon: Icons.folder, submenu: FOLDER_COLORS.map(fc => ({
+                label: fc.label,
+                icon: `<span style="display:inline-block;width:12px;height:12px;border-radius:2px;background:${fc.color}"></span>`,
+                action: async () => { node.color = fc.color === '#0078d4' ? undefined : fc.color; await saveVFS(); opts.colorCb(); logActivity('color', `${node.name} → ${fc.label}`); }
+            }))
+        });
+    } else {
+        items.push({ label: 'Open', icon: Icons.file, action: () => opts.openFn(node) });
+        items.push({ label: 'Edit as plain text', icon: Icons.rename, action: () => openFileAsText(node) });
+        items.push({ label: 'Export', icon: Icons.download, action: () => downloadFile(node) });
+    }
+    items.push({ label: 'Export as ZIP', icon: Icons.download, action: opts.exportZipFn });
+    items.push({ sep: true });
+    if (opts.hasCopy) items.push({ label: 'Copy', icon: Icons.copy, action: opts.copyFn });
+    items.push({ label: 'Cut', icon: Icons.cut, action: opts.cutFn });
+    items.push({ sep: true });
+    items.push({ label: 'Rename', icon: Icons.rename, action: () => renameNode(node) });
+    items.push({ sep: true });
+    items.push({
+        label: sel.size > 1 ? `Delete ${sel.size} items` : 'Delete', icon: Icons.trash, danger: true,
+        action: opts.deleteFn,
+    });
+    items.push({ sep: true });
+    items.push({ label: 'Properties', icon: Icons.info, action: () => showProps(node) });
+    return items;
+}
+
+/* ============================================================
    DESKTOP
    ============================================================ */
 const Desktop = {
@@ -1498,6 +1857,7 @@ const Desktop = {
         this._renderBreadcrumb();
         this._renderIcons();
         this.updateTaskbar();
+        document.title = 'SafeNova — ' + (App.container?.name || 'Container');
         // Re-render all open folder windows
         if (typeof WinManager !== 'undefined') WinManager.renderAll();
         // Load activity log from compressed storage (async)
@@ -1765,6 +2125,7 @@ const Desktop = {
                     if (id === _tdHoverFolder) return;
                     if (VFS.move(id, _tdHoverFolder) === 'ok') { moved.push(id); area.querySelector(`:scope > .file-item[data-id="${id}"]`)?.remove(); }
                 });
+                if (moved.length) logActivity('move', `${moved.length} item${moved.length > 1 ? 's' : ''} → ${VFS.node(_tdHoverFolder)?.name || 'folder'}`, moved.length);
                 moved.forEach(id => this._sel.delete(id));
                 _tdHoverFolder = null;
             } else {
@@ -1830,38 +2191,15 @@ const Desktop = {
         document.querySelector(`#desktop-area > .file-item[data-id="${node.id}"]`)?.classList.add('selected');
         this._updateSelectionBar();
         const _sync = () => { App.folder = this._desktopFolder; App.selection = this._sel; App._winCtx = null; };
-        const items = [];
-
-        if (node.type === 'folder') {
-            items.push({ label: 'Open', icon: Icons.open, action: () => WinManager.open(node.id) });
-            items.push({ label: 'Open in New Window', icon: Icons.newfolder, action: () => WinManager.open(node.id) });
-            items.push({
-                label: 'Folder Color', icon: Icons.folder, submenu: FOLDER_COLORS.map(fc => ({
-                    label: fc.label,
-                    icon: `<span style="display:inline-block;width:12px;height:12px;border-radius:2px;background:${fc.color}"></span>`,
-                    action: async () => { node.color = fc.color === '#0078d4' ? undefined : fc.color; await saveVFS(); Desktop._patchIcons(); logActivity('color', `${node.name} → ${fc.label}`); }
-                }))
-            });
-        } else {
-            items.push({ label: 'Open', icon: Icons.file, action: () => this._openNode(node) });
-            items.push({ label: 'Edit as plain text', icon: Icons.rename, action: () => openFileAsText(node) });
-            items.push({ label: 'Export', icon: Icons.download, action: () => downloadFile(node) });
-        }
-        items.push({ label: 'Export as ZIP', icon: Icons.download, action: () => exportAsZip([...this._sel]) });
-        items.push({ sep: true });
-        items.push({ label: 'Copy', icon: Icons.copy, action: () => { _sync(); copyItems(); } });
-        items.push({ label: 'Cut', icon: Icons.cut, action: () => { _sync(); cutItems(); } });
-        items.push({ sep: true });
-        items.push({ label: 'Rename', icon: Icons.rename, action: () => renameNode(node) });
-        items.push({ sep: true });
-        if (this._sel.size > 1) {
-            items.push({ label: `Delete ${this._sel.size} items`, icon: Icons.trash, danger: true, action: () => { _sync(); deleteSelected(); } });
-        } else {
-            items.push({ label: 'Delete', icon: Icons.trash, danger: true, action: () => { _sync(); deleteSelected(); } });
-        }
-        items.push({ sep: true });
-        items.push({ label: 'Properties', icon: Icons.info, action: () => showProps(node) });
-        showCtxMenu(e.clientX, e.clientY, items);
+        showCtxMenu(e.clientX, e.clientY, _buildIconMenuItems(node, this._sel, {
+            openFn: n => n.type === 'folder' ? WinManager.open(n.id) : this._openNode(n),
+            colorCb: () => Desktop._patchIcons(),
+            hasCopy: true,
+            copyFn: () => { _sync(); copyItems(); },
+            cutFn: () => { _sync(); cutItems(); },
+            exportZipFn: () => { _sync(); exportAsZip([...this._sel]); },
+            deleteFn: () => { _sync(); deleteSelected(); },
+        }));
     },
 
     _contextDesktop(e) {
@@ -1869,50 +2207,8 @@ const Desktop = {
         document.querySelectorAll('#desktop-area > .file-item.selected').forEach(i => i.classList.remove('selected'));
         this._updateSelectionBar();
         const _sync = () => { App.folder = this._desktopFolder; App.selection = this._sel; App._winCtx = null; };
-        const items = [
-            { label: 'New Text File', icon: Icons.newfile, action: () => { _sync(); App._ctxScreenPos = { x: e.clientX, y: e.clientY }; newTextFile(); } },
-            { label: 'New Folder', icon: Icons.newfolder, action: () => { _sync(); App._ctxScreenPos = { x: e.clientX, y: e.clientY }; newFolder(); } },
-            { sep: true },
-            { label: 'Import Files...', icon: Icons.upload, action: () => { _sync(); document.getElementById('file-input').click(); } },
-        ];
-        if (App.clipboard) {
-            items.push({ sep: true });
-            items.push({ label: 'Paste', icon: Icons.paste, action: () => { _sync(); pasteItems(); } });
-        }
-        const sortSub = [
-            {
-                label: 'By Name', icon: Icons.sortName, submenu: [
-                    { label: 'A → Z', icon: Icons.sortAsc, action: () => sortIcons('name', 'asc') },
-                    { label: 'Z → A', icon: Icons.sortDesc, action: () => sortIcons('name', 'desc') },
-                ]
-            },
-            {
-                label: 'By Date Modified', icon: Icons.sortDate, submenu: [
-                    { label: 'Newest first', icon: Icons.sortDesc, action: () => sortIcons('mtime', 'desc') },
-                    { label: 'Oldest first', icon: Icons.sortAsc, action: () => sortIcons('mtime', 'asc') },
-                ]
-            },
-            {
-                label: 'By Date Created', icon: Icons.sortDate, submenu: [
-                    { label: 'Newest first', icon: Icons.sortDesc, action: () => sortIcons('ctime', 'desc') },
-                    { label: 'Oldest first', icon: Icons.sortAsc, action: () => sortIcons('ctime', 'asc') },
-                ]
-            },
-            { sep: true },
-            {
-                label: 'By Size', icon: Icons.sortSize, submenu: [
-                    { label: 'Largest first', icon: Icons.sortDesc, action: () => sortIcons('size', 'desc') },
-                    { label: 'Smallest first', icon: Icons.sortAsc, action: () => sortIcons('size', 'asc') },
-                ]
-            },
-            { sep: true },
-            { label: 'By Type', icon: Icons.sortType, action: () => sortIcons('type', 'asc') },
-        ];
-        items.push({ sep: true });
-        items.push({ label: 'Sort', icon: Icons.sort, submenu: sortSub });
-        items.push({ sep: true });
-        items.push({ label: 'Refresh', icon: Icons.refresh, action: () => { Desktop._renderIcons(); if (typeof WinManager !== 'undefined') WinManager.renderAll(); } });
-        showCtxMenu(e.clientX, e.clientY, items);
+        showCtxMenu(e.clientX, e.clientY, _buildAreaMenuItems(e, _sync, undefined,
+            () => { Desktop._renderIcons(); if (typeof WinManager !== 'undefined') WinManager.renderAll(); }));
     },
 
     // Clear selection: empties both the Set AND removes .selected CSS classes from DOM
@@ -2604,51 +2900,9 @@ class FolderWindow {
         this.selection.clear();
         this.el.querySelectorAll('.file-item.selected').forEach(i => i.classList.remove('selected'));
         this._updateStatus();
-        const items = [
-            { label: 'New Text File', icon: Icons.newfile, action: () => { this._setCtx(); App._ctxScreenPos = { x: e.clientX, y: e.clientY }; newTextFile(); } },
-            { label: 'New Folder', icon: Icons.newfolder, action: () => { this._setCtx(); App._ctxScreenPos = { x: e.clientX, y: e.clientY }; newFolder(); } },
-            { sep: true },
-            { label: 'Import Files...', icon: Icons.upload, action: () => { this._setCtx(); document.getElementById('file-input').click(); } },
-        ];
-        if (App.clipboard) {
-            items.push({ sep: true });
-            items.push({ label: 'Paste', icon: Icons.paste, action: () => { this._setCtx(); pasteItems(); } });
-        }
-        const self = this;
-        const sortSub = [
-            {
-                label: 'By Name', icon: Icons.sortName, submenu: [
-                    { label: 'A → Z', icon: Icons.sortAsc, action: () => sortIcons('name', 'asc', self) },
-                    { label: 'Z → A', icon: Icons.sortDesc, action: () => sortIcons('name', 'desc', self) },
-                ]
-            },
-            {
-                label: 'By Date Modified', icon: Icons.sortDate, submenu: [
-                    { label: 'Newest first', icon: Icons.sortDesc, action: () => sortIcons('mtime', 'desc', self) },
-                    { label: 'Oldest first', icon: Icons.sortAsc, action: () => sortIcons('mtime', 'asc', self) },
-                ]
-            },
-            {
-                label: 'By Date Created', icon: Icons.sortDate, submenu: [
-                    { label: 'Newest first', icon: Icons.sortDesc, action: () => sortIcons('ctime', 'desc', self) },
-                    { label: 'Oldest first', icon: Icons.sortAsc, action: () => sortIcons('ctime', 'asc', self) },
-                ]
-            },
-            { sep: true },
-            {
-                label: 'By Size', icon: Icons.sortSize, submenu: [
-                    { label: 'Largest first', icon: Icons.sortDesc, action: () => sortIcons('size', 'desc', self) },
-                    { label: 'Smallest first', icon: Icons.sortAsc, action: () => sortIcons('size', 'asc', self) },
-                ]
-            },
-            { sep: true },
-            { label: 'By Type', icon: Icons.sortType, action: () => sortIcons('type', 'asc', self) },
-        ];
-        items.push({ sep: true });
-        items.push({ label: 'Sort', icon: Icons.sort, submenu: sortSub });
-        items.push({ sep: true });
-        items.push({ label: 'Refresh', icon: Icons.refresh, action: () => { this._renderedFolderId = null; this.render(); } });
-        showCtxMenu(e.clientX, e.clientY, items);
+        const syncFn = () => this._setCtx();
+        showCtxMenu(e.clientX, e.clientY, _buildAreaMenuItems(e, syncFn, this,
+            () => { this._renderedFolderId = null; this.render(); }));
     }
 
     _contextIcon(e, node) {
@@ -2659,37 +2913,15 @@ class FolderWindow {
         this.selection.add(node.id);
         this.el.querySelector(`.file-item[data-id="${node.id}"]`)?.classList.add('selected');
         this._updateStatus();
-        const items = [];
-        if (node.type === 'folder') {
-            items.push({ label: 'Open', icon: Icons.open, action: () => this._openNode(node) });
-            items.push({ label: 'Open in New Window', icon: Icons.newfolder, action: () => WinManager.open(node.id) });
-            const self = this;
-            items.push({
-                label: 'Folder Color', icon: Icons.folder, submenu: FOLDER_COLORS.map(fc => ({
-                    label: fc.label,
-                    icon: `<span style="display:inline-block;width:12px;height:12px;border-radius:2px;background:${fc.color}"></span>`,
-                    action: async () => { node.color = fc.color === '#0078d4' ? undefined : fc.color; await saveVFS(); self.render(); logActivity('color', `${node.name} → ${fc.label}`); }
-                }))
-            });
-        } else {
-            items.push({ label: 'Open', icon: Icons.file, action: () => openFile(node) });
-            items.push({ label: 'Edit as plain text', icon: Icons.rename, action: () => openFileAsText(node) });
-            items.push({ label: 'Export', icon: Icons.download, action: () => downloadFile(node) });
-        }
-        items.push({ label: 'Export as ZIP', icon: Icons.download, action: () => this._withCtxSync(() => exportAsZip([...this.selection])) });
-        items.push({ sep: true });
-        items.push({ label: 'Cut', icon: Icons.cut, action: () => this._withCtxSync(() => cutItems()) });
-        items.push({ sep: true });
-        items.push({ label: 'Rename', icon: Icons.rename, action: () => renameNode(node) });
-        items.push({ sep: true });
-        const sz = this.selection.size;
-        items.push({
-            label: sz > 1 ? `Delete ${sz} items` : 'Delete', icon: Icons.trash, danger: true,
-            action: () => { this._setCtx(); deleteSelected(); }
-        });
-        items.push({ sep: true });
-        items.push({ label: 'Properties', icon: Icons.info, action: () => showProps(node) });
-        showCtxMenu(e.clientX, e.clientY, items);
+        showCtxMenu(e.clientX, e.clientY, _buildIconMenuItems(node, this.selection, {
+            openFn: n => n.type === 'folder' ? this._openNode(n) : openFile(n),
+            colorCb: () => this.render(),
+            hasCopy: false,
+            copyFn: null,
+            cutFn: () => this._withCtxSync(() => cutItems()),
+            exportZipFn: () => this._withCtxSync(() => exportAsZip([...this.selection])),
+            deleteFn: () => { this._setCtx(); deleteSelected(); },
+        }));
     }
 
     /* ---- RESIZE HANDLE ---- */

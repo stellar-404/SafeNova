@@ -136,6 +136,7 @@ const App = {
 
     // Return to home WITHOUT killing the session (password stays remembered)
     async backToMenu() {
+        document.title = 'SafeNova';
         this.key = null;
         this.container = null;
         this.folder = 'root';
@@ -156,6 +157,7 @@ const App = {
     },
 
     async lockContainer() {
+        document.title = 'SafeNova';
         const cid = this.container?.id;
         if (cid) clearSession(cid);
         this.key = null;

@@ -2597,6 +2597,137 @@ input[type="password"]::-ms-clear {
 }
 
 /* ============================================================
+   CONTAINER INTEGRITY SCANNER MODAL
+   ============================================================ */
+.modal-scanner {
+    width: 560px;
+    min-width: 520px;
+    max-width: 620px;
+    height: 500px;
+    display: flex;
+    flex-direction: column;
+    overflow: hidden;
+}
+.scanner-body {
+    display: flex;
+    flex-direction: column;
+    gap: 14px;
+    padding: 18px 20px !important;
+    flex: 1 1 0;
+    min-height: 0;
+    overflow: hidden;
+}
+.scanner-desc {
+    display: flex;
+    align-items: flex-start;
+    gap: 12px;
+    flex-shrink: 0;
+}
+.scanner-shield {
+    flex-shrink: 0;
+    color: var(--accent);
+    opacity: .7;
+    margin-top: 2px;
+}
+.scanner-desc-title {
+    font-size: 13px;
+    font-weight: 600;
+    color: var(--text);
+    margin-bottom: 3px;
+}
+.scanner-desc-text {
+    font-size: 11.5px;
+    color: var(--text-dim);
+    line-height: 1.55;
+}
+.scanner-log {
+    border: 1px solid var(--border2);
+    border-radius: var(--r);
+    background: var(--bg2);
+    padding: 10px 12px;
+    font-size: 12px;
+    font-family: var(--font);
+    flex: 1 1 0;
+    min-height: 0;
+    overflow-y: auto;
+    display: flex;
+    flex-direction: column;
+    gap: 0;
+}
+.scanner-log:empty {
+    /* Placeholder-like appearance before scan starts */
+    background: color-mix(in srgb, var(--bg2) 80%, transparent);
+}
+.scanner-step {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    padding: 4px 0;
+    color: var(--text-dim);
+    font-size: 12px;
+    line-height: 1.4;
+}
+.scanner-step-icon {
+    flex-shrink: 0;
+    width: 16px;
+    height: 16px;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+}
+.scanner-step-icon .spinner {
+    width: 12px;
+    height: 12px;
+    border: 1.5px solid var(--border2);
+    border-top-color: var(--accent);
+    border-radius: 50%;
+    animation: spin .6s linear infinite;
+}
+@keyframes spin { to { transform: rotate(360deg); } }
+.scanner-step-icon svg { display: block; }
+.scanner-step.pass .scanner-step-icon { color: #34d399; }
+.scanner-step.fail .scanner-step-icon { color: #e74856; }
+.scanner-step.warn .scanner-step-icon { color: #f59e0b; }
+.scanner-step .scanner-step-label {
+    flex: 1;
+}
+.scanner-step .scanner-step-result {
+    font-size: 11px;
+    color: var(--text-dim);
+    opacity: .7;
+    white-space: nowrap;
+}
+.scanner-step.fail .scanner-step-result { color: #e74856; opacity: 1; }
+.scanner-step.warn .scanner-step-result { color: #f59e0b; opacity: 1; }
+.scanner-summary {
+    border-radius: var(--r);
+    padding: 12px 14px;
+    font-size: 12.5px;
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    flex-shrink: 0;
+}
+.scanner-summary.healthy {
+    background: color-mix(in srgb, #34d399 8%, var(--bg2));
+    border: 1px solid color-mix(in srgb, #34d399 25%, transparent);
+    color: #34d399;
+}
+.scanner-summary.issues {
+    background: color-mix(in srgb, #f59e0b 8%, var(--bg2));
+    border: 1px solid color-mix(in srgb, #f59e0b 25%, transparent);
+    color: #f59e0b;
+}
+.scanner-summary.repaired {
+    background: color-mix(in srgb, #34d399 8%, var(--bg2));
+    border: 1px solid color-mix(in srgb, #34d399 25%, transparent);
+    color: #34d399;
+}
+.scanner-summary svg { flex-shrink: 0; }
+.scanner-summary-text { line-height: 1.5; }
+.scanner-summary-text strong { font-weight: 600; color: var(--text); }
+
+/* ============================================================
    AUTH DOT (red dot in context menu)
    ============================================================ */
 .auth-dot {

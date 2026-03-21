@@ -190,9 +190,461 @@ const VFS = (() => {
         }
     }
 
+    // ── Integrity checker ──────────────────────────────────────
+    // Returns array of step results: [{ name, status:'pass'|'warn'|'fail', detail, issues[], fixed[] }]
+    // When repair=true, fixes issues in-place. Synchronous (VFS structure only).
+    function check(repair) {
+        const steps = [];
+
+        function step(name, fn) {
+            const issues = [], fixed = [];
+            const log = (sev, msg) => issues.push({ sev, msg });
+            const fix = (msg) => fixed.push(msg);
+            fn(log, fix);
+            const hasCrit = issues.some(i => i.sev === 'critical');
+            const status = issues.length === 0 ? 'pass' : hasCrit ? 'fail' : 'warn';
+            const detail = issues.length === 0 ? 'OK' : `${issues.length} issue${issues.length !== 1 ? 's' : ''}${repair && fixed.length ? `, ${fixed.length} fixed` : ''}`;
+            steps.push({ name, status, detail, issues, fixed });
+        }
+
+        // 1. Root node & position map
+        step('Root node integrity', (log, fix) => {
+            if (!_nodes.root) {
+                log('critical', 'Root node missing');
+                if (repair) { _nodes.root = { id: 'root', type: 'folder', name: '/', parentId: null, ctime: Date.now(), mtime: Date.now() }; fix('Recreated root node'); }
+            } else {
+                if (_nodes.root.parentId !== null) {
+                    log('warn', 'Root has non-null parentId');
+                    if (repair) { _nodes.root.parentId = null; fix('Set root parentId to null'); }
+                }
+                if (_nodes.root.type !== 'folder') {
+                    log('critical', 'Root node type is not folder');
+                    if (repair) { _nodes.root.type = 'folder'; fix('Fixed root type to folder'); }
+                }
+            }
+            if (!_pos.root) {
+                log('warn', 'Root position map missing');
+                if (repair) { _pos.root = {}; fix('Recreated root position map'); }
+            }
+        });
+
+        const allIds = Object.keys(_nodes);
+
+        // 2. Node required fields
+        step('Node field validation', (log, fix) => {
+            for (const id of allIds) {
+                const n = _nodes[id];
+                if (!n.id || n.id !== id) {
+                    log('critical', `Node "${id}": id mismatch or missing`);
+                    if (repair) { n.id = id; fix(`Fixed id for "${id}"`); }
+                }
+                if (id !== 'root' && !n.name) {
+                    log('warn', `Node "${id}": name missing`);
+                    if (repair) { n.name = 'Recovered_' + id.slice(0, 6); fix(`Set fallback name for "${id}"`); }
+                }
+                if (!n.type || !['file', 'folder'].includes(n.type)) {
+                    log('warn', `Node "${id}": invalid type "${n.type}"`);
+                    if (repair) { n.type = 'file'; fix(`Set type to file for "${id}"`); }
+                }
+            }
+        });
+
+        // 3. Node ID format validation
+        step('Node ID format validation', (log, fix) => {
+            const uuidRe = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+            const fallbackRe = /^[0-9a-z]{6,20}$/i;
+            let badCount = 0;
+            for (const id of allIds) {
+                if (id === 'root') continue;
+                if (!uuidRe.test(id) && !fallbackRe.test(id)) {
+                    badCount++;
+                    log('warn', `"${id.slice(0, 24)}${id.length > 24 ? '…' : ''}": malformed node ID`);
+                    if (repair) {
+                        const n = _nodes[id], newId = (typeof crypto !== 'undefined' && crypto.randomUUID) ? crypto.randomUUID() : Date.now().toString(36) + Math.random().toString(36).slice(2);
+                        n.id = newId;
+                        _nodes[newId] = n;
+                        delete _nodes[id];
+                        // Update children referencing old ID as parent
+                        for (const cid of Object.keys(_nodes)) {
+                            if (_nodes[cid].parentId === id) _nodes[cid].parentId = newId;
+                        }
+                        // Migrate position data
+                        if (_pos[id]) { _pos[newId] = _pos[id]; delete _pos[id]; }
+                        for (const pid of Object.keys(_pos)) {
+                            if (_pos[pid][id]) { _pos[pid][newId] = _pos[pid][id]; delete _pos[pid][id]; }
+                        }
+                        fix(`Reassigned ID for "${n.name || newId}"`);
+                    }
+                }
+            }
+        });
+
+        // 4. Timestamp anomaly detection (mass-corruption indicator)
+        step('Timestamp anomaly detection', (log) => {
+            if (allIds.length < 20) return; // not enough nodes to detect anomalies
+            const ctimeMap = new Map();
+            for (const id of allIds) {
+                if (id === 'root') continue;
+                const ct = _nodes[id].ctime;
+                if (ct) { ctimeMap.set(ct, (ctimeMap.get(ct) || 0) + 1); }
+            }
+            // Find largest cluster of identical ctimes
+            let maxCluster = 0, maxTime = 0;
+            for (const [t, count] of ctimeMap) {
+                if (count > maxCluster) { maxCluster = count; maxTime = t; }
+            }
+            const total = allIds.length - 1;
+            if (maxCluster > total * 0.5 && maxCluster > 50) {
+                log('warn', `${maxCluster} of ${total} nodes share identical ctime (${new Date(maxTime).toISOString()}) — possible VFS corruption`);
+            }
+            // Check for abnormally high node count relative to position entries
+            const posEntries = Object.values(_pos).reduce((s, m) => s + Object.keys(m).length, 0);
+            const filesCount = allIds.filter(id => _nodes[id]?.type === 'file').length;
+            const foldersCount = allIds.filter(id => _nodes[id]?.type === 'folder').length - 1;
+            if (filesCount > 5000) log('warn', `Unusually high file count: ${filesCount} — verify container is not corrupted`);
+            if (foldersCount > 5000) log('warn', `Unusually high folder count: ${foldersCount} — verify container is not corrupted`);
+        });
+
+        // 5. File name validation
+        step('File name validation', (log, fix) => {
+            for (const id of allIds) {
+                if (id === 'root') continue;
+                const n = _nodes[id];
+                if (typeof n.name === 'string') {
+                    if (n.name.trim() === '') {
+                        log('warn', `Node "${id}": name is empty/whitespace`);
+                        if (repair) { n.name = 'Unnamed_' + id.slice(0, 6); fix(`Set fallback name for "${id}"`); }
+                    } else if (n.name.length > 255) {
+                        log('warn', `"${n.name.slice(0, 30)}...": name exceeds 255 chars`);
+                        if (repair) { n.name = n.name.slice(0, 200) + '…'; fix(`Truncated name of "${id}"`); }
+                    } else if (/[<>:"/\\|?*\x00-\x1f]/.test(n.name)) {
+                        log('warn', `"${n.name}": contains invalid characters`);
+                        if (repair) { n.name = n.name.replace(/[<>:"/\\|?*\x00-\x1f]/g, '_'); fix(`Sanitized name of "${id}"`); }
+                    }
+                }
+            }
+        });
+
+        // 6. Orphaned nodes (parentId → non-existent node)
+        step('Orphaned node detection', (log, fix) => {
+            for (const id of allIds) {
+                if (id === 'root') continue;
+                const n = _nodes[id];
+                if (n.parentId && !_nodes[n.parentId]) {
+                    log('critical', `"${n.name || id}": parent "${n.parentId}" does not exist`);
+                    if (repair) { n.parentId = 'root'; fix(`Reattached "${n.name || id}" to root`); }
+                }
+                if (!n.parentId) {
+                    log('warn', `"${n.name || id}": missing parentId`);
+                    if (repair) { n.parentId = 'root'; fix(`Assigned parentId=root for "${n.name || id}"`); }
+                }
+            }
+        });
+
+        // 7. Parent type validation — parent must be a folder
+        step('Parent type validation', (log, fix) => {
+            for (const id of allIds) {
+                if (id === 'root') continue;
+                const n = _nodes[id];
+                const parent = _nodes[n.parentId];
+                if (parent && parent.type !== 'folder') {
+                    log('critical', `"${n.name || id}": parent "${parent.name || n.parentId}" is not a folder`);
+                    if (repair) { n.parentId = 'root'; fix(`Reattached "${n.name || id}" to root (parent was a file)`); }
+                }
+            }
+        });
+
+        // 8. Cycle detection
+        step('Parent-child cycle detection', (log, fix) => {
+            for (const id of allIds) {
+                if (id === 'root') continue;
+                const chain = new Set();
+                let cur = id;
+                while (cur && cur !== 'root') {
+                    if (chain.has(cur)) {
+                        log('critical', `Cycle at "${_nodes[cur]?.name || cur}"`);
+                        if (repair) { _nodes[cur].parentId = 'root'; fix(`Broke cycle: reattached "${_nodes[cur]?.name || cur}" to root`); }
+                        break;
+                    }
+                    if (!_nodes[cur]) break;
+                    chain.add(cur);
+                    cur = _nodes[cur].parentId;
+                }
+            }
+        });
+
+        // 9. Reachability — every non-root node must reach root
+        step('Node reachability analysis', (log, fix) => {
+            for (const id of allIds) {
+                if (id === 'root') continue;
+                const visited = new Set();
+                let cur = id, reachable = false;
+                while (cur) {
+                    if (cur === 'root') { reachable = true; break; }
+                    if (visited.has(cur)) break;
+                    visited.add(cur);
+                    cur = _nodes[cur]?.parentId;
+                }
+                if (!reachable) {
+                    log('warn', `"${_nodes[id]?.name || id}" is unreachable from root`);
+                    if (repair) { _nodes[id].parentId = 'root'; fix(`Reattached unreachable "${_nodes[id]?.name || id}" to root`); }
+                }
+            }
+        });
+
+        // 10. Timestamp validation
+        step('Timestamp integrity', (log, fix) => {
+            const now = Date.now(), futureThreshold = now + 86400000;
+            for (const id of allIds) {
+                const n = _nodes[id];
+                if (!n.ctime || typeof n.ctime !== 'number' || n.ctime <= 0) {
+                    log('warn', `"${n.name || id}": invalid ctime`);
+                    if (repair) { n.ctime = now; fix(`Fixed ctime for "${n.name || id}"`); }
+                } else if (n.ctime > futureThreshold) {
+                    log('warn', `"${n.name || id}": ctime is in the future`);
+                    if (repair) { n.ctime = now; fix(`Reset future ctime for "${n.name || id}"`); }
+                }
+                if (!n.mtime || typeof n.mtime !== 'number' || n.mtime <= 0) {
+                    log('warn', `"${n.name || id}": invalid mtime`);
+                    if (repair) { n.mtime = now; fix(`Fixed mtime for "${n.name || id}"`); }
+                } else if (n.mtime > futureThreshold) {
+                    log('warn', `"${n.name || id}": mtime is in the future`);
+                    if (repair) { n.mtime = now; fix(`Reset future mtime for "${n.name || id}"`); }
+                }
+                if (n.mtime && n.ctime && n.mtime < n.ctime) {
+                    log('warn', `"${n.name || id}": mtime is earlier than ctime`);
+                    if (repair) { n.mtime = n.ctime; fix(`Corrected mtime for "${n.name || id}"`); }
+                }
+            }
+        });
+
+        // 11. File size & folder size validation
+        step('File size validation', (log, fix) => {
+            for (const id of allIds) {
+                const n = _nodes[id];
+                if (n.type === 'file') {
+                    if (n.size !== undefined && (!Number.isFinite(n.size) || n.size < 0)) {
+                        log('warn', `"${n.name || id}": invalid size ${n.size}`);
+                        if (repair) { n.size = 0; fix(`Reset size for "${n.name || id}"`); }
+                    }
+                    if (n.size === undefined) {
+                        log('warn', `"${n.name || id}": missing size property`);
+                        if (repair) { n.size = 0; fix(`Set size=0 for "${n.name || id}"`); }
+                    }
+                }
+                if (n.type === 'folder' && n.size !== undefined) {
+                    log('warn', `Folder "${n.name || id}": has size property`);
+                    if (repair) { delete n.size; fix(`Removed size from folder "${n.name || id}"`); }
+                }
+            }
+        });
+
+        // 12. File MIME type check
+        step('File metadata validation', (log, fix) => {
+            for (const id of allIds) {
+                const n = _nodes[id];
+                if (n.type === 'file') {
+                    // Ensure mime is a string if present
+                    if (n.mime !== undefined && typeof n.mime !== 'string') {
+                        log('warn', `"${n.name || id}": invalid mime type`);
+                        if (repair) { delete n.mime; fix(`Removed invalid mime for "${n.name || id}"`); }
+                    }
+                }
+                // Check for unexpected extra properties
+                const allowed = new Set(['id', 'name', 'type', 'parentId', 'ctime', 'mtime', 'size', 'mime', 'color']);
+                for (const key of Object.keys(n)) {
+                    if (!allowed.has(key)) {
+                        log('warn', `"${n.name || id}": unexpected property "${key}"`);
+                        if (repair) { delete n[key]; fix(`Removed unknown property "${key}" from "${n.name || id}"`); }
+                    }
+                }
+            }
+        });
+
+        // 13. Duplicate names in same parent
+        step('Duplicate name detection', (log, fix) => {
+            const parentChildren = {};
+            for (const id of allIds) {
+                if (id === 'root') continue;
+                const pid = _nodes[id].parentId;
+                if (!parentChildren[pid]) parentChildren[pid] = [];
+                parentChildren[pid].push(_nodes[id]);
+            }
+            for (const pid of Object.keys(parentChildren)) {
+                const seen = new Map();
+                for (const n of parentChildren[pid]) {
+                    const lower = n.name?.toLowerCase();
+                    if (seen.has(lower)) {
+                        log('warn', `Duplicate "${n.name}" in "${_nodes[pid]?.name || pid}"`);
+                        if (repair) {
+                            let counter = 2, base = n.name, ext = '';
+                            const dotIdx = base.lastIndexOf('.');
+                            if (n.type === 'file' && dotIdx > 0) { ext = base.slice(dotIdx); base = base.slice(0, dotIdx); }
+                            while (parentChildren[pid].some(s => s.name.toLowerCase() === (base + ' (' + counter + ')' + ext).toLowerCase())) counter++;
+                            n.name = base + ' (' + counter + ')' + ext;
+                            fix(`Renamed duplicate to "${n.name}"`);
+                        }
+                    } else {
+                        seen.set(lower, n);
+                    }
+                }
+            }
+        });
+
+        // 14. Empty folder chains (folder containing only empty folders, depth > 5)
+        step('Empty folder chain detection', (log) => {
+            const childCount = {};
+            for (const id of allIds) {
+                if (id === 'root') continue;
+                const pid = _nodes[id].parentId;
+                if (!childCount[pid]) childCount[pid] = { files: 0, folders: 0 };
+                if (_nodes[id].type === 'file') childCount[pid].files++;
+                else childCount[pid].folders++;
+            }
+            function emptyDepth(fid, visited) {
+                if (visited.has(fid)) return 0;
+                visited.add(fid);
+                const cc = childCount[fid];
+                if (!cc || (cc.files === 0 && cc.folders === 0)) return 1;
+                if (cc.files > 0) return 0;
+                let maxD = 0;
+                for (const id of allIds) {
+                    if (_nodes[id].parentId === fid && _nodes[id].type === 'folder') {
+                        maxD = Math.max(maxD, emptyDepth(id, visited));
+                    }
+                }
+                return maxD > 0 ? maxD + 1 : 0;
+            }
+            for (const id of allIds) {
+                if (_nodes[id]?.type !== 'folder' || id === 'root') continue;
+                const d = emptyDepth(id, new Set());
+                if (d > 5) log('warn', `"${_nodes[id].name}": empty folder chain ${d} levels deep`);
+            }
+        });
+
+        // 15. Stale position entries
+        step('Position table cleanup', (log, fix) => {
+            for (const pid of Object.keys(_pos)) {
+                if (pid !== 'root' && !_nodes[pid]) {
+                    log('warn', `Position map for deleted folder "${pid}"`);
+                    if (repair) { delete _pos[pid]; fix(`Removed stale position map "${pid}"`); }
+                    continue;
+                }
+                for (const nid of Object.keys(_pos[pid] || {})) {
+                    if (!_nodes[nid]) {
+                        log('warn', `Position for deleted node "${nid}"`);
+                        if (repair) { delete _pos[pid][nid]; fix(`Removed stale position "${nid}"`); }
+                    } else if (_nodes[nid].parentId !== pid) {
+                        log('warn', `"${_nodes[nid]?.name || nid}" positioned in wrong folder`);
+                        if (repair) { delete _pos[pid][nid]; fix(`Removed misplaced position for "${_nodes[nid]?.name || nid}"`); }
+                    }
+                }
+            }
+        });
+
+        // 16. Missing position maps for folders
+        step('Folder position maps', (log, fix) => {
+            for (const id of allIds) {
+                if (_nodes[id].type === 'folder' && !_pos[id]) {
+                    log('warn', `Folder "${_nodes[id].name || id}" has no position map`);
+                    if (repair) { _pos[id] = {}; fix(`Created position map for "${_nodes[id].name || id}"`); }
+                }
+            }
+        });
+
+        // 17. Position completeness — every child should have a position entry
+        step('Position entry completeness', (log, fix) => {
+            for (const id of allIds) {
+                if (id === 'root') continue;
+                const pid = _nodes[id].parentId;
+                if (pid && _pos[pid] && !_pos[pid][id]) {
+                    log('warn', `"${_nodes[id]?.name || id}" has no position in parent folder`);
+                    if (repair) {
+                        const ap = autoPos(pid, 0, null);
+                        _pos[pid][id] = { x: ap.x, y: ap.y };
+                        fix(`Auto-positioned "${_nodes[id]?.name || id}"`);
+                    }
+                }
+            }
+        });
+
+        // 18. Position collisions
+        step('Position collision detection', (log, fix) => {
+            for (const pid of Object.keys(_pos)) {
+                const cellMap = new Map();
+                for (const nid of Object.keys(_pos[pid] || {})) {
+                    const p = _pos[pid][nid];
+                    const key = `${Math.round((p.x - 8) / GRID_X)}_${Math.round((p.y - 8) / GRID_Y)}`;
+                    if (cellMap.has(key)) {
+                        log('warn', `Collision: "${_nodes[nid]?.name || nid}" and "${_nodes[cellMap.get(key)]?.name || cellMap.get(key)}"`);
+                        if (repair) {
+                            const newP = autoPos(pid, 0, null);
+                            _pos[pid][nid] = { x: newP.x, y: newP.y };
+                            fix(`Relocated "${_nodes[nid]?.name || nid}"`);
+                        }
+                    } else {
+                        cellMap.set(key, nid);
+                    }
+                }
+            }
+        });
+
+        // 19. Grid alignment
+        step('Grid alignment verification', (log, fix) => {
+            for (const pid of Object.keys(_pos)) {
+                for (const nid of Object.keys(_pos[pid] || {})) {
+                    const p = _pos[pid][nid];
+                    const sx = 8 + Math.max(0, Math.round((p.x - 8) / GRID_X)) * GRID_X;
+                    const sy = 8 + Math.max(0, Math.round((p.y - 8) / GRID_Y)) * GRID_Y;
+                    if (p.x !== sx || p.y !== sy) {
+                        log('warn', `"${_nodes[nid]?.name || nid}" is off-grid (${p.x},${p.y})`);
+                        if (repair) { _pos[pid][nid] = { x: sx, y: sy }; fix(`Snapped "${_nodes[nid]?.name || nid}" to grid`); }
+                    }
+                }
+            }
+        });
+
+        // 20. Folder depth check
+        step('Folder depth analysis', (log) => {
+            for (const id of allIds) {
+                if (_nodes[id]?.type !== 'folder' || id === 'root') continue;
+                let depth = 0;
+                const visited = new Set();
+                let cur = id;
+                while (cur && cur !== 'root') {
+                    if (visited.has(cur)) break;
+                    visited.add(cur);
+                    depth++;
+                    cur = _nodes[cur]?.parentId;
+                }
+                if (depth > 50) log('warn', `"${_nodes[id]?.name || id}" is nested ${depth} levels deep`);
+            }
+        });
+
+        // 21. Node count & summary stats
+        step('Node count summary', (log) => {
+            const files = allIds.filter(id => _nodes[id]?.type === 'file').length;
+            const folders = allIds.filter(id => _nodes[id]?.type === 'folder').length - 1;
+            const posEntries = Object.values(_pos).reduce((s, m) => s + Object.keys(m).length, 0);
+            log('info', `${files} file${files !== 1 ? 's' : ''}, ${folders} folder${folders !== 1 ? 's' : ''}, ${posEntries} position entries`);
+        });
+
+        // Override: last step is always info-only (pass)
+        const last = steps[steps.length - 1];
+        last.status = 'pass';
+        last.detail = last.issues[0]?.msg || 'OK';
+
+        return steps;
+    }
+
+    // Returns list of file IDs that exist in VFS as type 'file'
+    function fileIds() {
+        return Object.keys(_nodes).filter(id => _nodes[id]?.type === 'file');
+    }
+
     return {
         init, fromObj, toObj, children, node, add, remove, rename, move, wouldCycle,
         getPos, setPos, delPos, totalSize, breadcrumb, fullPath, autoPos, hasChildNamed,
-        remapPositions
+        remapPositions, check, fileIds
     };
 })();

@@ -810,7 +810,7 @@
                             </label>
                         </div>
                         <div class="settings-row">
-                            <span class="settings-label">Activity Logs</span>
+                            <span class="settings-label">Activity logs</span>
                             <label class="switch" id="settings-activity-logs-toggle">
                                 <input type="checkbox" checked>
                                 <span class="switch-slider"></span>
@@ -818,7 +818,7 @@
                         </div>
                         <div class="settings-row settings-sub-row" id="settings-export-logs-row">
                             <span class="settings-sub-indicator"></span>
-                            <span class="settings-label">Export with Activity Logs</span>
+                            <span class="settings-label">Export with activity logs</span>
                             <label class="switch" id="settings-export-logs">
                                 <input type="checkbox">
                                 <span class="switch-slider"></span>
@@ -846,7 +846,7 @@
                     <div class="settings-section" style="margin-top:4px;">
                         <div class="settings-section-title">Personalization</div>
                         <div class="settings-row">
-                            <span class="settings-label">Icon Size</span>
+                            <span class="settings-label">Icon size</span>
                             <div class="settings-toggle-group" id="settings-icon-size">
                                 <button class="settings-toggle-btn active" data-value="small">Small</button>
                                 <button class="settings-toggle-btn" data-value="normal">Normal</button>
@@ -854,25 +854,35 @@
                             </div>
                         </div>
                         <div class="settings-row">
-                            <span class="settings-label">Show Grid Dots</span>
+                            <span class="settings-label">Show grid dots</span>
                             <label class="switch" id="settings-grid-dots">
                                 <input type="checkbox" checked>
                                 <span class="switch-slider"></span>
                             </label>
                         </div>
                         <div class="settings-row">
-                            <span class="settings-label">Disable Animations</span>
+                            <span class="settings-label">Disable animations</span>
                             <label class="switch" id="settings-animations">
                                 <input type="checkbox">
                                 <span class="switch-slider"></span>
                             </label>
                         </div>
                         <div class="settings-row">
-                            <span class="settings-label">Show Drag Position Preview</span>
+                            <span class="settings-label">Show drag position preview</span>
                             <label class="switch" id="settings-snap-highlight">
                                 <input type="checkbox" checked>
                                 <span class="switch-slider"></span>
                             </label>
+                        </div>
+                    </div>
+                    <div class="settings-section" style="margin-top:4px;">
+                        <div class="settings-section-title">Diagnostics</div>
+                        <div class="settings-row">
+                            <span class="settings-label">Container integrity</span>
+                            <button class="btn" id="fs-check-open">
+                                <svg width="13" height="13" viewBox="0 0 16 16" fill="none"><path d="M8 1.5L2 5v4c0 4.1 2.6 7.8 6 9 3.4-1.2 6-4.9 6-9V5l-6-3.5z" stroke="currentColor" stroke-width="1.3" fill="none"/><path d="M6 8.5l2 2 3-3.5" stroke="currentColor" stroke-width="1.4" stroke-linecap="square" stroke-linejoin="round"/></svg>
+                                Run diagnostics
+                            </button>
                         </div>
                     </div>
                 </div>
@@ -912,9 +922,43 @@
                         <div class="alog-content" id="alog-content"></div>
                     </div>
                 </div>
+
             </div>
             <div class="modal-footer">
                 <button class="btn btn-primary" id="settings-ok">Done</button>
+            </div>
+        </div>
+
+    <!-- ==================== SCANNER MODAL ==================== -->
+        <div class="modal modal-scanner" id="modal-scanner" style="display:none">
+            <div class="modal-header">
+                <span class="modal-title">Container Integrity Scanner</span>
+                <button class="modal-close" id="scanner-close">
+                    <svg width="14" height="14" viewBox="0 0 14 14" fill="none" xmlns="http://www.w3.org/2000/svg">
+                        <path d="M2 2l10 10M12 2L2 12" stroke="currentColor" stroke-width="1.5" stroke-linecap="square" />
+                    </svg>
+                </button>
+            </div>
+            <div class="modal-body scanner-body">
+                <div class="scanner-desc">
+                    <svg class="scanner-shield" width="32" height="32" viewBox="0 0 24 26" fill="none">
+                        <path d="M12 3L3.5 7.5v4.5c0 5.2 3.6 10 8.5 11.5 4.9-1.5 8.5-6.3 8.5-11.5V7.5L12 3z" stroke="currentColor" stroke-width="1.5" fill="none"/>
+                        <path d="M9 13l2.5 2.5 4-4.5" stroke="currentColor" stroke-width="1.6" stroke-linecap="square" stroke-linejoin="round"/>
+                    </svg>
+                    <div>
+                        <div class="scanner-desc-title">Full container scan</div>
+                        <div class="scanner-desc-text">Deep analysis of the virtual disk image, encrypted file table, folder hierarchy, desktop layout, and workspace environment of this crypto-container.</div>
+                    </div>
+                </div>
+                <div class="scanner-log" id="scanner-log"></div>
+                <div class="scanner-summary" id="scanner-summary" style="display:none"></div>
+            </div>
+            <div class="modal-footer">
+                <button class="btn" id="scanner-repair" style="display:none">
+                    <svg width="13" height="13" viewBox="0 0 16 16" fill="none"><path d="M2 9l3 3 7-8" stroke="currentColor" stroke-width="1.6" stroke-linecap="square" stroke-linejoin="round"/></svg>
+                    Auto-Repair
+                </button>
+                <button class="btn btn-primary" id="scanner-start">Start Scan</button>
             </div>
         </div>
 

@@ -23,6 +23,10 @@ const Home = {
             empty.style.display = 'flex';
         } else {
             empty.style.display = 'none';
+            // Re-validate stored sessions: clear stale/expired ones before rendering badges
+            for (const c of containers) {
+                if (hasSession(c.id)) await loadSession(c.id);
+            }
             const savedOrder = _loadCardOrder();
             containers.sort((a, b) => {
                 const ia = savedOrder.indexOf(a.id), ib = savedOrder.indexOf(b.id);
