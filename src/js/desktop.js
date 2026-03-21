@@ -942,7 +942,7 @@ const Desktop = {
                             movedIds.push(id);
                         });
                         // Remove moved icons from desktop DOM and move selection
-                        winTarget.selection.clear();
+                        winTarget._clearSelection();
                         movedIds.forEach(id => {
                             this._sel.delete(id);
                             winTarget.selection.add(id);
@@ -1020,7 +1020,7 @@ const Desktop = {
                     });
                     // Remove moved icons from DOM and try to select in target window if open
                     const targetWinForFolder = typeof WinManager !== 'undefined' ? WinManager._wins.find(w => w.folderId === hoverFolder) : null;
-                    if (targetWinForFolder) targetWinForFolder.selection.clear();
+                    if (targetWinForFolder) targetWinForFolder._clearSelection();
 
                     movedIds.forEach(id => {
                         this._sel.delete(id);
@@ -1335,6 +1335,13 @@ const Desktop = {
         items.push({ sep: true });
         items.push({ label: 'Refresh', icon: Icons.refresh, action: () => { Desktop._renderIcons(); if (typeof WinManager !== 'undefined') WinManager.renderAll(); } });
         showCtxMenu(e.clientX, e.clientY, items);
+    },
+
+    // Clear selection: empties both the Set AND removes .selected CSS classes from DOM
+    _clearSelection() {
+        this._sel.clear();
+        document.querySelectorAll('#desktop-area > .file-item.selected').forEach(i => i.classList.remove('selected'));
+        this._updateSelectionBar();
     },
 
     _updateSelectionBar() {
@@ -1847,6 +1854,13 @@ class FolderWindow {
     }
 
     /* ---- SET CONTEXT for modal-based and async ops ---- */
+    // Clear selection: empties both the Set AND removes .selected CSS classes from DOM
+    _clearSelection() {
+        this.selection.clear();
+        this.el.querySelectorAll('.file-item.selected').forEach(i => i.classList.remove('selected'));
+        this._updateStatus();
+    }
+
     _setCtx() {
         App._winCtx = this;
         App.folder = this.folderId;
@@ -2365,7 +2379,7 @@ class FolderWindow {
                         movedIds.push(id);
                     });
                     // Remove moved items from source window DOM (no full re-render = no flash)
-                    targetWin.selection.clear();
+                    targetWin._clearSelection();
                     movedIds.forEach(id => {
                         this.selection.delete(id);
                         targetWin.selection.add(id);
@@ -2393,7 +2407,7 @@ class FolderWindow {
                         movedIds.push(id);
                     });
                     const targetWinForFolder = typeof WinManager !== 'undefined' ? WinManager._wins.find(w => w.folderId === hoverFolder) : null;
-                    if (targetWinForFolder) targetWinForFolder.selection.clear();
+                    if (targetWinForFolder) targetWinForFolder._clearSelection();
                     movedIds.forEach(id => {
                         this.selection.delete(id);
                         if (targetWinForFolder) targetWinForFolder.selection.add(id);
