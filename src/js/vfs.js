@@ -142,9 +142,12 @@ const VFS = (() => {
     }
 
     function totalSize() {
-        return Object.values(_nodes)
-            .filter(n => n.type === 'file')
-            .reduce((s, n) => s + (Number.isFinite(n.size) ? n.size : 0), 0);
+        let sum = 0;
+        for (const id in _nodes) {
+            const n = _nodes[id];
+            if (n.type === 'file' && Number.isFinite(n.size)) sum += n.size;
+        }
+        return sum;
     }
 
     function breadcrumb(folderId) {

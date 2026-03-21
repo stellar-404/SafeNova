@@ -80,9 +80,11 @@ function isVideo(mime) { return mime.startsWith('video/'); }
 function isPDF(mime) { return mime === 'application/pdf'; }
 
 function buf2b64(buf) {
-    const bytes = new Uint8Array(buf);
+    const u8 = buf instanceof Uint8Array ? buf : new Uint8Array(buf);
+    const CHUNK = 8192;
     let s = '';
-    for (let i = 0; i < bytes.length; i++) s += String.fromCharCode(bytes[i]);
+    for (let i = 0; i < u8.length; i += CHUNK)
+        s += String.fromCharCode.apply(null, u8.subarray(i, Math.min(i + CHUNK, u8.length)));
     return btoa(s);
 }
 function b642buf(s) {

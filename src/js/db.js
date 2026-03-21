@@ -52,6 +52,15 @@ const DB = (() => {
             tx.oncomplete = () => res();
             tx.onerror = () => rej(tx.error);
         }),
+        // Batch-save multiple file records in a single IndexedDB transaction
+        saveFiles: (files) => new Promise((res, rej) => {
+            if (!files || !files.length) { res(); return; }
+            const tx = _db.transaction('files', 'readwrite');
+            const store = tx.objectStore('files');
+            files.forEach(f => store.put(f));
+            tx.oncomplete = () => res();
+            tx.onerror = () => rej(tx.error);
+        }),
 
         /* vfs */
         saveVFS: (cid, iv, blob) => wrap(rw('vfs').put({ cid, iv, blob })),
@@ -61,7 +70,7 @@ const DB = (() => {
         /* nuke container — deletes everything */
         async nukeContainer(cid) {
             const files = await this.getFilesByCid(cid);
-            await Promise.all(files.map(f => this.deleteFile(f.id)));
+            if (files.length) await this.deleteFiles(files.map(f => f.id));
             await this.deleteVFS(cid);
             await this.deleteContainer(cid);
         }

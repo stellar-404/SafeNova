@@ -292,32 +292,36 @@ async function doChangePassword() {
         showLoading('Re-encrypting VFS…');
         const vfsRec = await DB.getVFS(c.id);
         if (vfsRec) {
-            const vfsBuf = await Crypto.decrypt(oldKey, vfsRec.iv, vfsRec.blob);
-            const vfsText = new TextDecoder().decode(vfsBuf);
-            const { iv: newVfsIv, blob: newVfsBlob } = await Crypto.encrypt(newKey, vfsText);
+            const vfsBuf = typeof vfsRec.blob === 'string'
+                ? await Crypto.decrypt(oldKey, vfsRec.iv, vfsRec.blob)
+                : await Crypto.decryptBin(oldKey, vfsRec.iv, vfsRec.blob);
+            const { iv: newVfsIv, blob: newVfsBlob } = await Crypto.encryptBin(newKey, vfsBuf);
             await DB.saveVFS(c.id, newVfsIv, newVfsBlob);
         }
 
-        // Re-encrypt all files
+        // Re-encrypt all files (parallel batches)
         const files = await DB.getFilesByCid(c.id);
-        for (let i = 0; i < files.length; i++) {
-            showLoading(`Re-encrypting file ${i + 1} / ${files.length}…`);
-            const f = files[i];
-            const buf = await Crypto.decryptBin(oldKey, f.iv, f.blob);
-            const { iv, blob } = await Crypto.encryptBin(newKey, buf);
-            await DB.saveFile({ id: f.id, cid: f.cid, iv: Array.from(iv), blob });
+        const BATCH = 4;
+        for (let i = 0; i < files.length; i += BATCH) {
+            const batch = files.slice(i, i + BATCH);
+            await Promise.all(batch.map(async f => {
+                const buf = await Crypto.decryptBin(oldKey, f.iv, f.blob);
+                const { iv, blob } = await Crypto.encryptBin(newKey, buf);
+                await DB.saveFile({ id: f.id, cid: f.cid, iv: Array.from(iv), blob });
+            }));
+            showLoading(`Re-encrypting files\u2026 ${Math.min(i + BATCH, files.length)}/${files.length}`);
         }
 
         // Re-encrypt lazyWorkspace manifest if present (imported-but-never-unlocked containers)
         if (c.lazyWorkspace) {
             showLoading('Re-encrypting workspace…');
             const { bin, mIv, mBlob } = c.lazyWorkspace;
-            const manifestBuf = await Crypto.decrypt(oldKey, Array.from(mIv), buf2b64(mBlob));
-            const reEnc = await Crypto.encrypt(newKey, manifestBuf);
+            const manifestBuf = await Crypto.decryptBin(oldKey, Array.from(mIv), mBlob.buffer || mBlob);
+            const reEnc = await Crypto.encryptBin(newKey, manifestBuf);
             c.lazyWorkspace = {
                 bin,
                 mIv: new Uint8Array(reEnc.iv),
-                mBlob: new Uint8Array(b642buf(reEnc.blob)),
+                mBlob: new Uint8Array(reEnc.blob),
             };
         }
 
@@ -682,11 +686,13 @@ async function doUnlock() {
             return;
         }
 
-        // Load VFS
+        // Load VFS (detect binary vs legacy base64 format)
         const vfsRec = await DB.getVFS(c.id);
         if (vfsRec) {
             try {
-                const buf = await Crypto.decrypt(key, vfsRec.iv, vfsRec.blob);
+                const buf = typeof vfsRec.blob === 'string'
+                    ? await Crypto.decrypt(key, vfsRec.iv, vfsRec.blob)
+                    : await Crypto.decryptBin(key, vfsRec.iv, vfsRec.blob);
                 const json = JSON.parse(new TextDecoder().decode(buf));
                 VFS.fromObj(json);
             } catch { VFS.init(); }
@@ -698,13 +704,14 @@ async function doUnlock() {
             showLoading('Restoring files from import\u2026');
             try {
                 const { bin, mIv, mBlob } = c.lazyWorkspace;
-                const decBuf = await Crypto.decrypt(key, Array.from(mIv), buf2b64(mBlob));
+                const decBuf = await Crypto.decryptBin(key, Array.from(mIv), mBlob.buffer || mBlob);
                 const manifest = JSON.parse(new TextDecoder().decode(decBuf));
-                for (const m of manifest) {
-                    const iv = Array.from(Uint8Array.from(atob(m.ivB64), ch => ch.charCodeAt(0))),
-                        blob = bin.slice(m.offset, m.offset + m.size).buffer;
-                    await DB.saveFile({ id: m.id, cid: c.id, iv, blob });
-                }
+                const filesToSave = manifest.map(m => ({
+                    id: m.id, cid: c.id,
+                    iv: Array.from(Uint8Array.from(atob(m.ivB64), ch => ch.charCodeAt(0))),
+                    blob: bin.slice(m.offset, m.offset + m.size).buffer
+                }));
+                await DB.saveFiles(filesToSave);
                 const cleanCont = Object.assign({}, c);
                 delete cleanCont.lazyWorkspace;
                 await DB.saveContainer(cleanCont);
@@ -792,7 +799,9 @@ async function _resumeSession(c, rawKeyBytes) {
         const vfsRec = await DB.getVFS(c.id);
         if (vfsRec) {
             try {
-                const buf = await Crypto.decrypt(key, vfsRec.iv, vfsRec.blob);
+                const buf = typeof vfsRec.blob === 'string'
+                    ? await Crypto.decrypt(key, vfsRec.iv, vfsRec.blob)
+                    : await Crypto.decryptBin(key, vfsRec.iv, vfsRec.blob);
                 const json = JSON.parse(new TextDecoder().decode(buf));
                 VFS.fromObj(json);
             } catch { VFS.init(); }
@@ -802,13 +811,14 @@ async function _resumeSession(c, rawKeyBytes) {
         if (c.lazyWorkspace) {
             try {
                 const { bin, mIv, mBlob } = c.lazyWorkspace;
-                const decBuf = await Crypto.decrypt(key, Array.from(mIv), buf2b64(mBlob));
+                const decBuf = await Crypto.decryptBin(key, Array.from(mIv), mBlob.buffer || mBlob);
                 const manifest = JSON.parse(new TextDecoder().decode(decBuf));
-                for (const m of manifest) {
-                    const iv = Array.from(Uint8Array.from(atob(m.ivB64), ch => ch.charCodeAt(0))),
-                        blob = bin.slice(m.offset, m.offset + m.size).buffer;
-                    await DB.saveFile({ id: m.id, cid: c.id, iv, blob });
-                }
+                const filesToSave = manifest.map(m => ({
+                    id: m.id, cid: c.id,
+                    iv: Array.from(Uint8Array.from(atob(m.ivB64), ch => ch.charCodeAt(0))),
+                    blob: bin.slice(m.offset, m.offset + m.size).buffer
+                }));
+                await DB.saveFiles(filesToSave);
                 const cleanCont = Object.assign({}, c);
                 delete cleanCont.lazyWorkspace;
                 await DB.saveContainer(cleanCont);

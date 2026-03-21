@@ -6,8 +6,8 @@
 async function saveVFS() {
     if (!App.key || !App.container) return;
     try {
-        const json = JSON.stringify(VFS.toObj()),
-            { iv, blob } = await Crypto.encrypt(App.key, json);
+        const jsonBuf = new TextEncoder().encode(JSON.stringify(VFS.toObj())),
+            { iv, blob } = await Crypto.encryptBin(App.key, jsonBuf);
         await DB.saveVFS(App.container.id, iv, blob);
         App.container.totalSize = VFS.totalSize();
         // Strip raw log so only compressed _alogZ gets persisted
