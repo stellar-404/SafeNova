@@ -611,7 +611,7 @@ function sortIcons(by = 'name', dir = 'asc', winCtx = null) {
         const col = i % cols, row = Math.floor(i / cols);
         const x = 8 + col * GRID_X, y = 8 + row * GRID_Y;
         VFS.setPos(fid, n.id, x, y);
-        const el = area.querySelector(`.file-item[data-id="${n.id}"]`);
+        const el = area._iconMap?.get(n.id) ?? area.querySelector(`.file-item[data-id="${n.id}"]`);
         if (el) {
             el.style.transition = 'left 0.12s ease, top 0.12s ease';
             el.style.left = x + 'px'; el.style.top = y + 'px';

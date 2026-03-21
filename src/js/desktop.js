@@ -1446,12 +1446,12 @@ function _initAreaTouchRubberBand(area, owner) {
                 w = Math.abs(cx - sx), h = Math.abs(cy - sy);
             _rbBand.style.cssText = `left:${x}px;top:${y}px;width:${w}px;height:${h}px`;
             const bx2 = x + w, by2 = y + h;
-            area.querySelectorAll(':scope > .file-item').forEach(item => {
+            for (const item of (area._iconMap?.values() ?? area.querySelectorAll(':scope > .file-item'))) {
                 const ix = parseInt(item.style.left), iy = parseInt(item.style.top),
                     hit = ix < bx2 && (ix + ICON_W) > x && iy < by2 && (iy + ICON_H) > y;
                 if (hit) { owner.selection.add(item.dataset.id); item.classList.add('selected'); }
                 else { owner.selection.delete(item.dataset.id); item.classList.remove('selected'); }
-            });
+            }
             owner._updateStatus();
         }
     }, { passive: false });
@@ -1480,12 +1480,12 @@ function _rubberBandSelect(e, area, sel, onUpdate) {
             w = Math.abs(cx - sx), h = Math.abs(cy - sy);
         band.style.cssText = `left:${x}px;top:${y}px;width:${w}px;height:${h}px`;
         const bx1 = x, by1 = y, bx2 = x + w, by2 = y + h;
-        area.querySelectorAll(':scope > .file-item').forEach(item => {
+        for (const item of (area._iconMap?.values() ?? area.querySelectorAll(':scope > .file-item'))) {
             const ix = parseInt(item.style.left), iy = parseInt(item.style.top),
                 hit = ix < bx2 && (ix + ICON_W) > bx1 && iy < by2 && (iy + ICON_H) > by1;
             if (hit) { sel.add(item.dataset.id); item.classList.add('selected'); }
             else if (!e.ctrlKey && !e.metaKey) { sel.delete(item.dataset.id); item.classList.remove('selected'); }
-        });
+        }
         onUpdate();
     };
     const onUp = () => { band.remove(); document.removeEventListener('mousemove', onMove); document.removeEventListener('mouseup', onUp); };
@@ -1512,12 +1512,16 @@ function _startIconDrag(e, node, el, srcCtx) {
     const isDesktop = srcCtx.winEl === null,
         srcArea = srcCtx.area;
 
+    // Build O(1) element lookup for hot-path drag operations (uses iconMap when available)
+    const selEls = new Map();
+    srcCtx.selection.forEach(id => {
+        const it = srcArea._iconMap?.get(id) ?? srcArea.querySelector(`.file-item[data-id="${id}"]`);
+        if (it) selEls.set(id, it);
+    });
+
     // Elevate z-index for desktop items during drag
     if (isDesktop) {
-        srcCtx.selection.forEach(id => {
-            const it = srcArea.querySelector(`:scope > .file-item[data-id="${id}"]`);
-            if (it) it.style.zIndex = '7900';
-        });
+        selEls.forEach(it => { it.style.zIndex = '7900'; });
     }
 
     const areaRect = srcArea.getBoundingClientRect(),
@@ -1527,12 +1531,9 @@ function _startIconDrag(e, node, el, srcCtx) {
         startX = e.clientX,
         startY = e.clientY;
 
-    // Snapshot start positions of all selected icons
+    // Snapshot start positions of all selected icons (reuse selEls — no extra querySelector)
     const startPosMap = {};
-    srcCtx.selection.forEach(id => {
-        const it = srcArea.querySelector(`.file-item[data-id="${id}"]`);
-        if (it) startPosMap[id] = { x: parseInt(it.style.left), y: parseInt(it.style.top) };
-    });
+    selEls.forEach((it, id) => { startPosMap[id] = { x: parseInt(it.style.left), y: parseInt(it.style.top) }; });
 
     // Build occupied map for snap preview excluding dragged items
     const srcOccupied = new Map();
@@ -1578,7 +1579,7 @@ function _startIconDrag(e, node, el, srcCtx) {
 
     function _snapBackSrc() {
         srcCtx.selection.forEach(id => {
-            const item = srcArea.querySelector(`.file-item[data-id="${id}"]`),
+            const item = selEls.get(id),
                 sp = startPosMap[id];
             if (item && sp) {
                 item.style.transition = 'left 0.12s ease, top 0.12s ease';
@@ -1668,18 +1669,12 @@ function _startIconDrag(e, node, el, srcCtx) {
                 ghostEls.forEach(g => g.remove()); ghostEls = [];
                 deskSnapPreviewEls.forEach(p => p.remove()); deskSnapPreviewEls = [];
                 winSnapPreviewEls.forEach(p => p.remove()); winSnapPreviewEls = [];
-                srcCtx.selection.forEach(id => {
-                    const orig = srcArea.querySelector(`.file-item[data-id="${id}"]`);
-                    if (orig) orig.style.visibility = '';
-                });
+                selEls.forEach(orig => { orig.style.visibility = ''; });
             }
             if (outsideWindow && !escaped) {
                 // Escaping — hide originals, spawn ghosts on desktop
                 escaped = true;
-                srcCtx.selection.forEach(id => {
-                    const orig = srcArea.querySelector(`.file-item[data-id="${id}"]`);
-                    if (orig) orig.style.visibility = 'hidden';
-                });
+                selEls.forEach(orig => { orig.style.visibility = 'hidden'; });
                 const deskArea = document.getElementById('desktop-area'),
                     selIds = [...srcCtx.selection].sort((a, b) => a === node.id ? -1 : b === node.id ? 1 : 0);
                 selIds.forEach(id => {
@@ -1697,7 +1692,7 @@ function _startIconDrag(e, node, el, srcCtx) {
         // ---- position items / ghosts ---------------------------------------
         if (!escaped) {
             srcCtx.selection.forEach(id => {
-                const it = srcArea.querySelector(`.file-item[data-id="${id}"]`),
+                const it = selEls.get(id),
                     sp = startPosMap[id];
                 if (it && sp) { it.style.left = (sp.x + dx) + 'px'; it.style.top = (sp.y + dy) + 'px'; }
             });
@@ -1717,17 +1712,11 @@ function _startIconDrag(e, node, el, srcCtx) {
 
         // ---- hover-folder highlight ----------------------------------------
         if (!escaped) {
-            srcCtx.selection.forEach(id => {
-                const it = srcArea.querySelector(`.file-item[data-id="${id}"]`);
-                if (it) it.style.pointerEvents = 'none';
-            });
+            selEls.forEach(it => { it.style.pointerEvents = 'none'; });
         }
         const target = document.elementFromPoint(mv.clientX, mv.clientY);
         if (!escaped) {
-            srcCtx.selection.forEach(id => {
-                const it = srcArea.querySelector(`.file-item[data-id="${id}"]`);
-                if (it) it.style.pointerEvents = '';
-            });
+            selEls.forEach(it => { it.style.pointerEvents = ''; });
         }
         const folderEl = target?.closest('.file-item[data-id]');
         const newHover = folderEl && !srcCtx.selection.has(folderEl.dataset.id) &&
@@ -1803,10 +1792,7 @@ function _startIconDrag(e, node, el, srcCtx) {
 
         // Restore desktop z-index
         if (isDesktop) {
-            srcCtx.selection.forEach(id => {
-                const it = srcArea.querySelector(`:scope > .file-item[data-id="${id}"]`);
-                if (it) it.style.zIndex = '';
-            });
+            selEls.forEach(it => { it.style.zIndex = ''; });
         }
 
         if (!moved) {
@@ -1818,10 +1804,7 @@ function _startIconDrag(e, node, el, srcCtx) {
             }
             // Click without drag — restore visibility for FW items
             if (!isDesktop) {
-                srcCtx.selection.forEach(id => {
-                    const orig = srcArea.querySelector(`.file-item[data-id="${id}"]`);
-                    if (orig) orig.style.visibility = '';
-                });
+                selEls.forEach(orig => { orig.style.visibility = ''; });
             }
             return;
         }
@@ -1845,12 +1828,7 @@ function _startIconDrag(e, node, el, srcCtx) {
             });
             if (blocked) {
                 _snapBackSrc();
-                if (!isDesktop) {
-                    srcCtx.selection.forEach(id => {
-                        const orig = srcArea.querySelector(`.file-item[data-id="${id}"]`);
-                        if (orig) orig.style.visibility = '';
-                    });
-                }
+                if (!isDesktop) selEls.forEach(orig => { orig.style.visibility = ''; });
                 toast(`"${VFS.node(blocked)?.name}" is open in Explorer — close the window first`, 'error');
                 return;
             }
@@ -1860,10 +1838,7 @@ function _startIconDrag(e, node, el, srcCtx) {
         if (!isDesktop && escaped) {
             const srcR = srcCtx.winEl.getBoundingClientRect();
             if (lastX >= srcR.left && lastX <= srcR.right && lastY >= srcR.top && lastY <= srcR.bottom) {
-                srcCtx.selection.forEach(id => {
-                    const orig = srcArea.querySelector(`.file-item[data-id="${id}"]`);
-                    if (orig) orig.style.visibility = '';
-                });
+                selEls.forEach(orig => { orig.style.visibility = ''; });
                 return;
             }
         }
@@ -1878,10 +1853,7 @@ function _startIconDrag(e, node, el, srcCtx) {
         if (hoverFolder) {
             const movedIds = await _dropIntoFolder(hoverFolder, null, null);
             if (movedIds === false) {
-                if (!isDesktop) srcCtx.selection.forEach(id => {
-                    const orig = srcArea.querySelector(`.file-item[data-id="${id}"]`);
-                    if (orig) orig.style.visibility = '';
-                });
+                if (!isDesktop) selEls.forEach(orig => { orig.style.visibility = ''; });
                 return;
             }
             const targetWinForFolder = typeof WinManager !== 'undefined' ? WinManager._wins.find(w => w.folderId === hoverFolder) : null;
@@ -1889,13 +1861,12 @@ function _startIconDrag(e, node, el, srcCtx) {
             movedIds.forEach(id => {
                 srcCtx.selection.delete(id);
                 if (targetWinForFolder) targetWinForFolder.selection.add(id);
-                srcArea.querySelector(`:scope > .file-item[data-id="${id}"]`)?.remove();
-                if (!isDesktop) srcArea.querySelector(`.file-item[data-id="${id}"]`)?.remove();
+                selEls.get(id)?.remove();
                 srcArea._iconMap?.delete(id);
             });
             // snap back failures
             if (!isDesktop) srcCtx.selection.forEach(id => {
-                const orig = srcArea.querySelector(`.file-item[data-id="${id}"]`);
+                const orig = selEls.get(id);
                 if (orig) orig.style.visibility = '';
             });
             srcCtx.updateUI();
@@ -1914,10 +1885,7 @@ function _startIconDrag(e, node, el, srcCtx) {
                     dropPosY = lastY - tRect.top + tArea.scrollTop - clickOffY,
                     movedIds = await _dropIntoFolder(targetWin.folderId, dropPosX, dropPosY);
                 if (movedIds === false) {
-                    if (!isDesktop) srcCtx.selection.forEach(id => {
-                        const orig = srcArea.querySelector(`.file-item[data-id="${id}"]`);
-                        if (orig) orig.style.visibility = '';
-                    });
+                    if (!isDesktop) selEls.forEach(orig => { orig.style.visibility = ''; });
                     return;
                 }
                 const srcWin = !isDesktop ? (typeof WinManager !== 'undefined' ? WinManager._wins.find(w => w.el === srcCtx.winEl) : null) : null;
@@ -1925,14 +1893,12 @@ function _startIconDrag(e, node, el, srcCtx) {
                 movedIds.forEach(id => {
                     srcCtx.selection.delete(id);
                     targetWin.selection.add(id);
-                    const orig = srcArea.querySelector(`.file-item[data-id="${id}"]`);
-                    if (orig) orig.remove();
-                    if (isDesktop) srcArea.querySelector(`:scope > .file-item[data-id="${id}"]`)?.remove();
+                    selEls.get(id)?.remove();
                     srcArea._iconMap?.delete(id);
                 });
                 // snap back failures
                 if (!isDesktop) srcCtx.selection.forEach(id => {
-                    const orig = srcArea.querySelector(`.file-item[data-id="${id}"]`);
+                    const orig = selEls.get(id);
                     if (orig) orig.style.visibility = '';
                 });
                 srcCtx.updateUI();
@@ -1974,12 +1940,12 @@ function _startIconDrag(e, node, el, srcCtx) {
             movedIds.forEach(id => {
                 srcCtx.selection.delete(id);
                 Desktop._sel.add(id);
-                srcArea.querySelector(`.file-item[data-id="${id}"]`)?.remove();
+                selEls.get(id)?.remove();
                 srcArea._iconMap?.delete(id);
             });
             // snap back failures
             srcCtx.selection.forEach(id => {
-                const orig = srcArea.querySelector(`.file-item[data-id="${id}"]`);
+                const orig = selEls.get(id);
                 if (orig) {
                     orig.style.visibility = '';
                     const sp = startPosMap[id];
@@ -2000,10 +1966,7 @@ function _startIconDrag(e, node, el, srcCtx) {
         // ---- Case 4b: within-source snap ----------------------------------
         if (!isDesktop) {
             // restore visibility first
-            srcCtx.selection.forEach(id => {
-                const orig = srcArea.querySelector(`.file-item[data-id="${id}"]`);
-                if (orig) orig.style.visibility = '';
-            });
+            selEls.forEach(orig => { orig.style.visibility = ''; });
         }
         // Grid snap within source area
         const occupied = new Map();
@@ -2013,7 +1976,7 @@ function _startIconDrag(e, node, el, srcCtx) {
             if (p) occupied.set(`${Math.round((p.x - 8) / GRID_X)}_${Math.round((p.y - 8) / GRID_Y)}`, n.id);
         });
         srcCtx.selection.forEach(id => {
-            const item = srcArea.querySelector(`.file-item[data-id="${id}"]`);
+            const item = selEls.get(id);
             if (!item) return;
             const rawX = parseInt(item.style.left), rawY = parseInt(item.style.top),
                 snapped = _snapFreeCell(rawX, rawY, occupied),
