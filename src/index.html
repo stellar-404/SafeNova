@@ -157,16 +157,17 @@
                 Back
             </button>
             <div class="unlock-icon">
-                <svg width="40" height="40" viewBox="0 0 40 40" fill="none" xmlns="http://www.w3.org/2000/svg">
+                <svg width="36" height="36" viewBox="0 0 40 40" fill="none" xmlns="http://www.w3.org/2000/svg">
                     <rect x="7" y="18" width="26" height="18" rx="2" fill="var(--bg3)" stroke="var(--border2)" stroke-width="1.5" />
-                    <path d="M13 18v-5a7 7 0 0114 0v5" stroke="var(--accent)" stroke-width="2.5" stroke-linecap="square" />
-                    <circle cx="20" cy="27" r="3" fill="var(--accent)" />
+                    <path d="M13 18v-5a7 7 0 0114 0v5" stroke="var(--text-dim)" stroke-width="2.5" stroke-linecap="square" />
+                    <circle cx="20" cy="27" r="3" fill="var(--text-dim)" />
                 </svg>
             </div>
-            <div class="unlock-title">SafeNova Container</div>
-            <div class="unlock-name-badge" id="unlock-name">-</div>
+            <div class="unlock-identity">
+                <div class="unlock-eyebrow">SafeNova</div>
+                <div class="unlock-name-badge" id="unlock-name">-</div>
+            </div>
             <div class="form-group">
-                <label class="form-label">Master Password</label>
                 <div class="input-wrap">
                     <input type="password" class="input" id="unlock-pw" placeholder="Enter container password" autocomplete="current-password">
                     <button class="input-eye" id="unlock-pw-eye" tabindex="-1">
@@ -194,7 +195,7 @@
                     </label>
                     <label class="remember-opt disabled">
                         <input type="radio" name="remember-scope" id="remember-browser" value="browser" disabled>
-                        <span>Until signed out</span>
+                        <span>Stay signed in</span>
                     </label>
                 </div>
             </div>
