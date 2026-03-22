@@ -658,7 +658,8 @@ function canEditAsText(node) {
         'vue', 'svelte', 'astro',
         'dockerfile', 'makefile', 'cmake',
         'gitignore', 'gitattributes', 'editorconfig',
-        'prettierrc', 'eslintrc', 'babelrc'].includes(ext);
+        'prettierrc', 'eslintrc', 'babelrc', 'map',
+        'csproj'].includes(ext);
 }
 
 /* ============================================================
