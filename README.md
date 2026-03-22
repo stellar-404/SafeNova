@@ -43,7 +43,7 @@ Key properties:
 | File encryption  | AES-256-GCM (random 96-bit IV per file)                |
 | VFS encryption   | AES-256-GCM (same key, independent IV)                 |
 | Session tokens   | AES-256-GCM, dual-key: per-tab ephemeral or persistent |
-| Browser key wrap | HKDF-SHA-256 from browser fingerprint, never stored    |
+| Browser key wrap | HKDF-SHA-256 from fingerprint + cookie + IndexedDB    |
 | Integrity check  | AES-256-GCM verification blob authenticated on open    |
 
 Every file is encrypted individually — each with its own freshly generated IV. The virtual filesystem (folder tree, file names, sizes, positions) is encrypted as a separate blob using the same derived key. The plaintext password is never stored; only the derived key is held in JavaScript memory for the duration of an active session.
@@ -68,22 +68,31 @@ This is the recommended option: the session is automatically gone as soon as the
 
 The key material is encrypted with **`snv-bsk`** — a shared AES-256-GCM key available to all tabs of the same browser origin.
 
-#### Browser-fingerprint key wrapping
+#### Three-source key wrapping
 
-Before `snv-bsk` is written to `localStorage`, it is itself encrypted with a separate _wrap key_ that is derived on-the-fly via **HKDF-SHA-256** from a browser fingerprint and **never stored anywhere**:
+Before `snv-bsk` is written to `localStorage`, it is itself encrypted with a separate _wrap key_ that is derived on-the-fly via **HKDF-SHA-256** from **three independent sources** and **never stored anywhere**:
+
+| # | Source | Storage | Purpose |
+|---|--------|---------|-------|
+| 1 | Browser fingerprint | _(computed)_ | `origin \0 language \0 hardwareConcurrency \0 colorDepth \0 pixelDepth` |
+| 2 | `snv-kc` cookie | Cookie jar (`SameSite=Strict`, ~400 days TTL) | 32 random bytes, isolated from localStorage |
+| 3 | `snv-ki` record | Separate IndexedDB `SafeNovaKS` | 32 random bytes, independent from main `SafeNovaEFS` database |
 
 ```
-fingerprint = origin \0 language \0 hardwareConcurrency \0 colorDepth \0 pixelDepth
-wrap_key    = HKDF-SHA-256( ikm=fingerprint, salt=0×32, info="snv-browser-wrap-v1" )
+ikm      = fingerprint \0 cookie_bytes(32) \0 idb_bytes(32)
+wrap_key = HKDF-SHA-256( ikm, salt=0×32, info="snv-browser-wrap-v2" )
 snv-bsk (localStorage) = IV(12) || AES-256-GCM( wrap_key, raw_bsk_bytes )
 ```
 
 Consequences:
 
--   Any tab in the **same browser** recomputes the identical fingerprint → identical wrap key → can decrypt `snv-bsk` and resume the session seamlessly
--   An attacker who **copies `localStorage`** to another machine or a different browser (disk image, malware exfil) will encounter a different deployment origin and/or hardware profile → different fingerprint → different wrap key → `snv-bsk` decryption fails → all session blobs become permanently opaque to them
+-   Any tab in the **same browser** recomputes the identical fingerprint, reads the same cookie and IDB secret → identical wrap key → can decrypt `snv-bsk` and resume the session seamlessly
+-   An attacker must compromise **all three storage mechanisms** simultaneously to reconstruct the wrap key — `localStorage` alone, a disk image, or a partial export will not suffice:
+    -   Copying `localStorage` without the cookie and `SafeNovaKS` database → wrap key cannot be derived → `snv-bsk` is opaque
+    -   Clearing cookies invalidates the cookie component → sessions become undecryptable
+    -   Deleting or moving the `SafeNovaKS` database invalidates the IDB component → same effect
 -   The fingerprint is intentionally **stable**: `navigator.userAgent` and `navigator.platform` are excluded because Chrome auto-updates silently (changing the UA string between launches), which would otherwise invalidate sessions on every browser update. Only properties that rarely or never change are used: deployment origin, system language, CPU core count, and display color depth
--   If the fingerprint does change (e.g., a system language switch or hardware reconfiguration), the stored `snv-bsk` can no longer be decrypted; a new key is generated automatically and the user must re-enter the password once — any `snv-sb-{cid}` blobs encrypted with the old key are silently dropped
+-   If any of the three components change (fingerprint shift, cookie clearing, IDB loss), the stored `snv-bsk` can no longer be decrypted; a new key is generated automatically and the user must re-enter the password once — any `snv-sb-{cid}` blobs encrypted with the old key are silently dropped
 -   **Legacy format migration:** `snv-bsk` entries written before fingerprint-wrapping was introduced (raw 32-byte keys, no IV prefix) are detected by their exact byte length and silently re-wrapped in the current `IV(12) || AES-GCM` format on first access — no user action required
 -   The session expires after **7 days** (TTL baked into the encrypted payload), or immediately on explicit sign-out
 
@@ -93,7 +102,7 @@ Both scope types use the same blob layout: `IV(12) || AES-256-GCM(scope_key, exp
 
 #### Remaining trade-off
 
-An attacker with live access to the running browser process (e.g. malicious extension, XSS) can still call the same fingerprint function and derive the wrap key. The browser-fingerprint layer protects against _offline_ credential theft (disk images, direct `localStorage` dumps), not against in-browser code execution.
+An attacker with live access to the running browser process (e.g. malicious extension, XSS) can still call the same fingerprint function, read the cookie, and query the `SafeNovaKS` IndexedDB to derive the wrap key. The three-source wrapping layer protects against _offline_ credential theft (disk images, direct `localStorage` dumps, partial storage exports), not against in-browser code execution.
 
 ---
 
