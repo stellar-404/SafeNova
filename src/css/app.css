@@ -2115,6 +2115,15 @@ input[type="password"]::-ms-clear {
     background-image: radial-gradient(circle, #2a2a2a 1px, transparent 1px);
     background-size: calc(24px * var(--icon-scale)) calc(24px * var(--icon-scale));
     min-height: 0;
+    min-width: 0;
+}
+.fw-canvas {
+    position: absolute;
+    top: 0;
+    left: 0;
+    pointer-events: none;
+    min-width: 1px;
+    min-height: 1px;
 }
 
 /* Status bar */

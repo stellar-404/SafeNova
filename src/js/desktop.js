@@ -1491,14 +1491,21 @@ function _initAreaTouchRubberBand(area, owner) {
     }, { passive: true });
 }
 
-/* ---- Compute max icon extent and set area minWidth for horizontal scroll ---- */
+/* ---- Compute max icon extent and set canvas size for both scrollbars ---- */
 function _syncAreaWidth(area) {
-    let maxRight = 0;
+    let maxRight = 0, maxBottom = 0;
     for (const el of (area._iconMap?.values() ?? area.querySelectorAll(':scope > .file-item'))) {
         const r = parseInt(el.style.left) + (el.offsetWidth || 96);
+        const b = parseInt(el.style.top) + (el.offsetHeight || 96);
         if (r > maxRight) maxRight = r;
+        if (b > maxBottom) maxBottom = b;
     }
-    area.style.minWidth = maxRight > 0 ? (maxRight + 8) + 'px' : '';
+    area.style.minWidth = '';
+    const canvas = area._canvas || (area._canvas = area.querySelector(':scope > .fw-canvas'));
+    if (canvas) {
+        canvas.style.width  = maxRight  > 0 ? (maxRight  + 24) + 'px' : '';
+        canvas.style.height = maxBottom > 0 ? (maxBottom + 24) + 'px' : '';
+    }
 }
 
 /* ---- Shared touch-drag for icons (Desktop + FolderWindow) ----
@@ -2808,6 +2815,7 @@ class FolderWindow {
         <div class="fw-breadcrumb" id="fw-bc-${this.folderId}"></div>
       </div>
       <div class="fw-area" tabindex="0">
+        <div class="fw-canvas"></div>
         <div class="fw-drop-overlay">
           <svg width="36" height="36" viewBox="0 0 48 48" fill="none" xmlns="http://www.w3.org/2000/svg"><path d="M24 8v24M12 20l12-12 12 12M8 36h32v4H8z" stroke="currentColor" stroke-width="2.5" stroke-linecap="square"/></svg>
           Drop files to import
