@@ -69,7 +69,7 @@ The key material is encrypted with **`snv-bsk`** — a shared AES-256-GCM key av
 **Browser-fingerprint key wrapping.** Before `snv-bsk` is written to `localStorage`, it is itself encrypted with a separate *wrap key* that is derived on-the-fly via **HKDF-SHA-256** from a browser fingerprint and **never stored anywhere**:
 
 ```
-fingerprint = userAgent \0 language \0 platform \0 hardwareConcurrency \0 colorDepth \0 pixelDepth
+fingerprint = origin \0 language \0 hardwareConcurrency \0 colorDepth \0 pixelDepth
 wrap_key    = HKDF-SHA-256( ikm=fingerprint, salt=0×32, info="snv-browser-wrap-v1" )
 snv-bsk (localStorage) = IV(12) || AES-256-GCM( wrap_key, raw_bsk_bytes )
 ```
@@ -77,9 +77,13 @@ snv-bsk (localStorage) = IV(12) || AES-256-GCM( wrap_key, raw_bsk_bytes )
 Consequences:
 
 -   Any tab in the **same browser** recomputes the identical fingerprint → identical wrap key → can decrypt `snv-bsk` and resume the session seamlessly
--   An attacker who **copies `localStorage`** to another machine (disk image, malware exfil) gets a different `userAgent` / `platform` / etc. → different fingerprint → different wrap key → `snv-bsk` decryption fails → all session blobs become permanently opaque to them
--   Updating the browser (which changes `userAgent`) invalidates the wrap key. The stored `snv-bsk` can no longer be decrypted; a new one is generated automatically and the user must re-enter the password once
+-   An attacker who **copies `localStorage`** to another machine or a different browser (disk image, malware exfil) will encounter a different deployment origin and/or hardware profile → different fingerprint → different wrap key → `snv-bsk` decryption fails → all session blobs become permanently opaque to them
+-   The fingerprint is intentionally **stable**: `navigator.userAgent` and `navigator.platform` are excluded because Chrome auto-updates silently (changing the UA string between launches), which would otherwise invalidate sessions on every browser update. Only properties that rarely or never change are used: deployment origin, system language, CPU core count, and display color depth
+-   If the fingerprint does change (e.g., a system language switch or hardware reconfiguration), the stored `snv-bsk` can no longer be decrypted; a new key is generated automatically and the user must re-enter the password once — any `snv-sb-{cid}` blobs encrypted with the old key are silently dropped
+-   **Legacy format migration:** `snv-bsk` entries written before fingerprint-wrapping was introduced (raw 32-byte keys, no IV prefix) are detected by their exact byte length and silently re-wrapped in the current `IV(12) || AES-GCM` format on first access — no user action required
 -   The session expires after **7 days** (TTL baked into the encrypted payload), or immediately on explicit sign-out
+
+**Session payload format.** Both scope types use the same blob layout: `IV(12) || AES-256-GCM(scope_key, expiry(8 bytes, uint64 LE) || raw_key(32 bytes))`. The AES-GCM call is authenticated with the container ID as additional data (`snv-session:{cid}`), preventing a blob from one container from being replayed to unlock a different container. Tab-scope sessions use `expiry = Number.MAX_SAFE_INTEGER` (no TTL — the tab's `sessionStorage` is the only lifetime bound); browser-scope sessions carry a hard 7-day expiry.
 
 **Remaining trade-off:** an attacker with live access to the running browser process (e.g. malicious extension, XSS) can still call the same fingerprint function and derive the wrap key. The browser-fingerprint layer protects against *offline* credential theft (disk images, direct `localStorage` dumps), not against in-browser code execution.
 
