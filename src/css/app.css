@@ -1035,6 +1035,7 @@ html.snv-doc-hidden #home-doc-tab {
     flex: 1;
     position: relative;
     overflow: auto;
+    overscroll-behavior: none;
     background: #1e1e1e;
     background-image: radial-gradient(circle, #2a2a2a 1px, transparent 1px);
     background-size: calc(24px * var(--icon-scale)) calc(24px * var(--icon-scale));
@@ -1092,6 +1093,7 @@ body.no-animations * {
     transform: scale(var(--icon-scale));
     transform-origin: top left;
     -webkit-touch-callout: none; /* prevent native iOS long-press callout */
+    touch-action: none; /* prevent browser from stealing touch for scroll/pan gestures */
 }
 .file-item:hover {
     background: rgba(255, 255, 255, 0.05);
@@ -2233,6 +2235,7 @@ input[type="password"]::-ms-clear {
     position: relative;
     overflow-x: auto;
     overflow-y: auto;
+    overscroll-behavior: none;
     outline: none;
     background: #1e1e1e;
     background-image: radial-gradient(circle, #2a2a2a 1px, transparent 1px);
