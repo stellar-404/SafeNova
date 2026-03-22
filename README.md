@@ -25,23 +25,23 @@ Key properties:
 -   **Hardware key support** — optionally use a WebAuthn passkey to strengthen the container salt
 -   **Session memory** — optionally remember your session per tab (ephemeral, recommended) or persistently until manually signed out, using AES-GCM-encrypted session tokens; persistent sessions survive browser restarts
 -   **Cross-tab session protection** — a container can only be actively open in one browser tab at a time; a lightweight lock protocol detects conflicts and offers instant session takeover
--   **Container import / export** — portable `.safenova` container files
+-   **Container import / export** — portable `.safenova` container files; import is instantaneous (lazy workspace expansion on first unlock), export streams data chunk-by-chunk requiring no single contiguous allocation regardless of container size
 -   **Export password guard** — configurable setting (on by default) to require password confirmation before exporting; when disabled, active-session key is used directly
 -   **Sort & arrange** — sort icons by name, date, size, or type; drag to custom positions
 -   **Container integrity scanner** — 27 automated checks (21 VFS structural + 6 database-level) with one-click auto-repair, **Deep Clean** (flattens over-nested folder trees, repairs all metadata), and a backup prompt before any destructive operation
 -   **Settings** — three tabs: personalization, statistics, activity logs
 -   **Keyboard shortcuts** — `Delete`, `F2`, `Ctrl+A`, `Ctrl+C/X/V`, `Ctrl+S` (save in editor), `Escape`
--   **Mobile-friendly** — touch drag, rubber-band selection, single/double-tap gestures
+-   **Mobile-friendly** — long-press to drag icons, rubber-band selection, single/double-tap gestures, paste at finger position, multi-file drag with per-item snap previews
 
 ---
 
 ## 🔐 Encryption
 
-| Layer           | Algorithm                                              |
-| --------------- | ------------------------------------------------------ |
-| Key derivation  | Argon2id (19 MB memory, 2 iterations, 1 thread)        |
-| File encryption | AES-256-GCM (random 96-bit IV per file)                |
-| VFS encryption  | AES-256-GCM (same key, independent IV)                 |
+| Layer            | Algorithm                                              |
+| ---------------- | ------------------------------------------------------ |
+| Key derivation   | Argon2id (19 MB memory, 2 iterations, 1 thread)        |
+| File encryption  | AES-256-GCM (random 96-bit IV per file)                |
+| VFS encryption   | AES-256-GCM (same key, independent IV)                 |
 | Session tokens   | AES-256-GCM, dual-key: per-tab ephemeral or persistent |
 | Browser key wrap | HKDF-SHA-256 from browser fingerprint, never stored    |
 | Integrity check  | AES-256-GCM verification blob authenticated on open    |
@@ -70,7 +70,7 @@ The key material is encrypted with **`snv-bsk`** — a shared AES-256-GCM key av
 
 #### Browser-fingerprint key wrapping
 
-Before `snv-bsk` is written to `localStorage`, it is itself encrypted with a separate *wrap key* that is derived on-the-fly via **HKDF-SHA-256** from a browser fingerprint and **never stored anywhere**:
+Before `snv-bsk` is written to `localStorage`, it is itself encrypted with a separate _wrap key_ that is derived on-the-fly via **HKDF-SHA-256** from a browser fingerprint and **never stored anywhere**:
 
 ```
 fingerprint = origin \0 language \0 hardwareConcurrency \0 colorDepth \0 pixelDepth
@@ -93,7 +93,7 @@ Both scope types use the same blob layout: `IV(12) || AES-256-GCM(scope_key, exp
 
 #### Remaining trade-off
 
-An attacker with live access to the running browser process (e.g. malicious extension, XSS) can still call the same fingerprint function and derive the wrap key. The browser-fingerprint layer protects against *offline* credential theft (disk images, direct `localStorage` dumps), not against in-browser code execution.
+An attacker with live access to the running browser process (e.g. malicious extension, XSS) can still call the same fingerprint function and derive the wrap key. The browser-fingerprint layer protects against _offline_ credential theft (disk images, direct `localStorage` dumps), not against in-browser code execution.
 
 ---
 
@@ -138,16 +138,16 @@ SafeNova/
 │   └── app.css         # All application styles
 │
 └── js/
-    ├── argon2.umd.min.js # Argon2id WASM/JS implementation
-    ├── constants.js    # Shared constants, utilities, icon SVGs
-    ├── state.js        # App state singleton (key, container, session)
-    ├── crypto.js       # AES-256-GCM + Argon2id encryption layer
-    ├── db.js           # IndexedDB abstraction (containers / files / vfs)
-    ├── vfs.js          # In-memory virtual filesystem
-    ├── fileops.js      # Upload, download, copy/paste, rename, delete
-    ├── home.js         # Container management (create, unlock, import, export)
-    ├── main.js         # Event binding and app boot
-    └── desktop.js      # Desktop UI — icons, folder windows, drag & drop
+    ├── argon2.umd.min.js  # Argon2id WASM/JS implementation
+    ├── constants.js       # Shared constants, utilities, icon SVGs
+    ├── state.js           # App state singleton (key, container, session)
+    ├── crypto.js          # AES-256-GCM + Argon2id encryption layer
+    ├── db.js              # IndexedDB abstraction (containers / files / vfs)
+    ├── vfs.js             # In-memory virtual filesystem
+    ├── fileops.js         # Upload, download, copy/paste, rename, delete
+    ├── home.js            # Container management (create, unlock, import, export)
+    ├── main.js            # Event binding and app boot
+    └── desktop.js         # Desktop UI — icons, folder windows, drag & drop
 ```
 
 ---
@@ -228,7 +228,16 @@ Re-encrypting a container under a new key dispatches all `decrypt → encrypt` p
 
 ### Container export
 
-Assembly of `workspace.bin` is performed with a **single pre-allocated `Uint8Array`** and sequential `TypedArray.set()` calls, avoiding repeated allocations and intermediate staging arrays.
+Exporting a `.safenova` file requires no single contiguous memory allocation regardless of container size. The builder receives each file blob as an individual `Uint8Array` chunk (no concatenation into a giant `workspaceBin`), computes CRC32 incrementally over the chunk list via `_crc32multi()`, and emits an **array of small output parts**. `downloadBuf()` passes that parts array directly to the `Blob` constructor — the browser stitches the pieces together internally without requiring a duplicate allocation. The peak RAM footprint for an N-gigabyte export is approximately N bytes (the data already held in IndexedDB), rather than the previous ~3× N that caused `Array buffer allocation failed` errors for 3 GB+ containers.
+
+### Drag-and-drop performance (large folders)
+
+Icon dragging in folders with many files previously re-iterated all `VFS.children()` results on **every** `mousemove` / `touchmove` frame (~60 fps) to rebuild the occupied-cell map. With hundreds of files this became a measurable bottleneck. The hot path is now O(1) per frame:
+
+-   **Touch drag** — the occupied map is built once at drag-start (when the 400 ms long-press fires) and reused throughout the gesture
+-   **Mouse drag** — `srcOccupied` is built once at drag-start; `winOccCached` / `deskOccCached` are computed once when the pointer first enters a drop target, not on every frame
+-   **Snap preview throttle** — snap-preview positions are recomputed only when the pointer crosses a grid cell boundary (96 px steps), not on every pixel movement
+-   **No full map clone** — `_showPreviews` uses a small `extra` overlay Map (one entry per selected item) instead of cloning the full `occMap` on each call; `_snapFreeCell` accepts that overlay as an optional second map and checks both without merging them
 
 ---
 
@@ -239,6 +248,32 @@ To prevent a container from being open in two browser tabs simultaneously — wh
 When a container is unlocked, the tab writes a claim entry (`snv-open-{id}`) containing its unique tab identifier and a timestamp. A **heartbeat** refreshes the timestamp every 5 seconds. Any other tab that reads a live claim (timestamp within the 30-second TTL) before opening the same container is shown a conflict dialog offering to take over the session.
 
 On accepting the takeover, the requesting tab writes a **kick flag** into the claim entry. The original tab listens for `storage` events on this key and immediately locks itself when the flag is detected. On normal tab close, `beforeunload` and `pagehide` remove the claim entry so the container becomes available to other tabs without waiting for the TTL to expire.
+
+---
+
+## 📱 Mobile Touch Support
+
+SafeNova is fully usable on touchscreen devices (Android Chrome, iOS Safari). All gesture interactions work on real hardware, not only in DevTools device emulation.
+
+### Long-press to drag
+
+Holding a finger on an icon for **400 ms** activates drag mode (haptic feedback where the OS supports it). The `touchstart` handler is registered as `{ passive: false }` on the icon area and immediately calls `e.preventDefault()` when the touch lands on an icon. This suppresses the native Android long-press gesture (which would otherwise fire `touchcancel` + `contextmenu` at ~500 ms and silently kill the drag). Scrolling on empty area is unaffected — `preventDefault` is only called when a `.file-item` is the touch target, and `.file-item` elements carry `touch-action: none` in CSS to prevent the browser's pan gesture recognizer from competing.
+
+### Multi-file drag
+
+All items in the current selection are dragged simultaneously. Each selected icon follows the same displacement vector as the primary icon. Snap previews are shown for every item in the selection, offset relative to one another to reflect final grid positions.
+
+### Context menu
+
+A short tap (< 350 ms) on an icon opens the context menu. A long press (≥ 400 ms) starts a drag instead of opening the menu. The two actions are mutually exclusive — if the native `contextmenu` event fires while a drag is already active, it is suppressed; if it fires before the drag timer completes, the timer is cancelled.
+
+### Paste at finger position
+
+When **Paste** is triggered from the context menu on a touch device, the items are placed at the position where the menu was opened, rather than defaulting to the origin. The context screen position (`App._ctxScreenPos`) is captured when the menu action is confirmed, and each pasted item is placed via `_snapFreeCell` relative to that position.
+
+### Overscroll
+
+`overscroll-behavior: none` is applied to `.desktop-area` and `.fw-area` to prevent pull-to-refresh and iOS overscroll bounce from interfering with drag gestures.
 
 ---
 

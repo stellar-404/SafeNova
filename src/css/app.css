@@ -3086,8 +3086,13 @@ input[type="password"]::-ms-clear {
     }
     .topbar-burger {
         display: flex;
+        align-items: center;
+        gap: 5px;
         margin-left: auto;
         flex-shrink: 0;
+        font-size: 13px;
+        font-weight: 500;
+        padding: 6px 10px;
     }
     .breadcrumb {
         font-size: 12px;
