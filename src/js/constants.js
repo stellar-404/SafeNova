@@ -12,6 +12,9 @@ const DB_NAME = 'SafeNovaEFS',
     ARGON2_ITER = 2,                            // time cost (iterations)
     ARGON2_PAR = 1,                             // parallelism
     VERIFY_TEXT = 'SafeNovaEFS-VERIFY-OK';
+// Degree of parallelism for AES-GCM operations: cap at 8 to avoid
+// flooding the thread with microtasks on high-core-count machines.
+const _CRYPTO_CONCURRENCY = Math.min(8, navigator.hardwareConcurrency || 4);
 let ICON_W = 84,
     ICON_H = 90;
 let GRID_X = 96,   // horizontal grid cell size

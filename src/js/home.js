@@ -315,18 +315,23 @@ async function doChangePassword() {
             await DB.saveVFS(c.id, newVfsIv, newVfsBlob);
         }
 
-        // Re-encrypt all files (parallel batches)
+        // Re-encrypt all files fully in parallel (Web Crypto is async/hardware-accelerated;
+        // browser schedules concurrent SubtleCrypto calls across available cores)
         const files = await DB.getFilesByCid(c.id);
-        const BATCH = 4;
-        for (let i = 0; i < files.length; i += BATCH) {
-            const batch = files.slice(i, i + BATCH);
-            await Promise.all(batch.map(async f => {
-                const buf = await Crypto.decryptBin(oldKey, f.iv, f.blob);
-                const { iv, blob } = await Crypto.encryptBin(newKey, buf);
-                await DB.saveFile({ id: f.id, cid: f.cid, iv: Array.from(iv), blob });
-            }));
-            showLoading(`Re-encrypting files\u2026 ${Math.min(i + BATCH, files.length)}/${files.length}`);
-        }
+        showLoading(`Re-encrypting files\u2026 0/${files.length}`);
+        let _reencDone = 0;
+        const reencResults = await Promise.allSettled(files.map(async f => {
+            const buf = await Crypto.decryptBin(oldKey, f.iv, f.blob);
+            const { iv, blob } = await Crypto.encryptBin(newKey, buf);
+            _reencDone++;
+            if (_reencDone % 4 === 0 || _reencDone === files.length)
+                showLoading(`Re-encrypting files\u2026 ${_reencDone}/${files.length}`);
+            return { id: f.id, cid: f.cid, iv: Array.from(iv), blob };
+        }));
+        const reencFiles = reencResults
+            .filter(r => r.status === 'fulfilled')
+            .map(r => r.value);
+        if (reencFiles.length) await DB.saveFiles(reencFiles);
 
         // Re-encrypt lazyWorkspace manifest if present (imported-but-never-unlocked containers)
         if (c.lazyWorkspace) {

@@ -41,26 +41,35 @@ async function uploadFiles(files) {
     showLoading(`Encrypting ${files.length} file${files.length > 1 ? 's' : ''}...`);
     let ok = 0, _okIds = [];
     const fileArr = Array.from(files);
-    const BATCH = 4;
+    const BATCH = _CRYPTO_CONCURRENCY;
     for (let i = 0; i < fileArr.length; i += BATCH) {
         const batch = fileArr.slice(i, i + BATCH);
-        const results = await Promise.allSettled(batch.map(async f => {
+        // Read all file buffers in this batch concurrently before encrypting
+        const bufs = await Promise.all(batch.map(f => f.arrayBuffer()));
+        const results = await Promise.allSettled(batch.map(async (f, bi) => {
             const name = sanitizeFilename(f.name),
-                buf = await f.arrayBuffer(),
                 mime = f.type || getMime(name),
-                { iv, blob } = await Crypto.encryptBin(App.key, buf),
+                { iv, blob } = await Crypto.encryptBin(App.key, bufs[bi]),
                 nodeId = uid();
             VFS.add({
                 id: nodeId, type: 'file', name, mime, size: f.size,
                 parentId: App.folder, ctime: Date.now(), mtime: Date.now()
             });
-            await DB.saveFile({ id: nodeId, cid: App.container.id, iv: Array.from(iv), blob });
-            return nodeId;
+            return { nodeId, rec: { id: nodeId, cid: App.container.id, iv: Array.from(iv), blob } };
         }));
+        // Batch-save all encrypted records in a single IDB transaction
+        const recs = [];
         for (let j = 0; j < results.length; j++) {
-            if (results[j].status === 'fulfilled') { ok++; _okIds.push(results[j].value); }
-            else { console.error('upload error', batch[j].name, results[j].reason); toast('Failed to encrypt: ' + batch[j].name, 'error'); }
+            if (results[j].status === 'fulfilled') {
+                ok++;
+                _okIds.push(results[j].value.nodeId);
+                recs.push(results[j].value.rec);
+            } else {
+                console.error('upload error', batch[j].name, results[j].reason);
+                toast('Failed to encrypt: ' + batch[j].name, 'error');
+            }
         }
+        if (recs.length) await DB.saveFiles(recs);
         showLoading(`Encrypting... ${Math.min(i + BATCH, fileArr.length)}/${fileArr.length}`);
     }
     await saveVFS();
@@ -127,7 +136,7 @@ async function _uploadDirEntry(dirEntry, targetFolderId, depth) {
     const fileEntries = entries.filter(e => e.isFile);
     const subDirEntries = entries.filter(e => e.isDirectory);
     // Encrypt files in this directory in parallel batches
-    const BATCH = 4;
+    const BATCH = _CRYPTO_CONCURRENCY;
     for (let i = 0; i < fileEntries.length; i += BATCH) {
         await Promise.allSettled(
             fileEntries.slice(i, i + BATCH).map(e => _uploadFileEntry(e, folderId))
@@ -1156,16 +1165,14 @@ async function exportAsZip(nodeIds, zipName) {
             }
         }
         for (const id of nodeIds) _collectFlat(id, '');
-        const DBATCH = 4;
-        for (let i = 0; i < _flat.length; i += DBATCH) {
-            const batch = _flat.slice(i, i + DBATCH);
-            const results = await Promise.allSettled(batch.map(async item => {
-                const rec = await DB.getFile(item.id); if (!rec) return null;
-                const buf = await Crypto.decryptBin(App.key, rec.iv, rec.blob);
-                return { name: item.name, data: new Uint8Array(buf), mtime: item.mtime };
-            }));
-            results.forEach(r => { if (r.status === 'fulfilled' && r.value) entries.push(r.value); });
-        }
+        // Fetch all file records in one IDB transaction, then decrypt fully in parallel
+        const fileMap = await DB.getFilesByIds(_flat.map(f => f.id));
+        const decResults = await Promise.allSettled(_flat.map(async item => {
+            const rec = fileMap.get(item.id); if (!rec) return null;
+            const buf = await Crypto.decryptBin(App.key, rec.iv, rec.blob);
+            return { name: item.name, data: new Uint8Array(buf), mtime: item.mtime };
+        }));
+        decResults.forEach(r => { if (r.status === 'fulfilled' && r.value) entries.push(r.value); });
         if (!entries.length) { toast('Nothing to export', 'warn'); hideLoading(); return; }
         const zip = _buildZip(entries);
         downloadBuf(zip.buffer, zipName, 'application/zip');
@@ -1258,21 +1265,21 @@ async function exportContainerFile(c, requirePassword = true) {
             now = Date.now();
 
         // Build file manifest and workspace.bin
-        const blobParts = [];
+        // Pre-convert blobs once, compute total size in a single pass
+        const fileChunks = fileRecs.map(f => new Uint8Array(f.blob instanceof ArrayBuffer ? f.blob : f.blob));
         let offset = 0;
-        const fileManifest = fileRecs.map(f => {
-            const data = new Uint8Array(f.blob instanceof ArrayBuffer ? f.blob : f.blob);
-            const ivB64 = btoa(String.fromCharCode(...new Uint8Array(f.iv instanceof Array ? f.iv : f.iv)));
-            const entry = { id: f.id, ivB64, offset, size: data.length };
-            blobParts.push(data);
-            offset += data.length;
+        const fileManifest = fileRecs.map((f, fi) => {
+            const ivArr = f.iv instanceof Array ? f.iv : Array.from(new Uint8Array(f.iv));
+            const ivB64 = btoa(String.fromCharCode(...ivArr));
+            const entry = { id: f.id, ivB64, offset, size: fileChunks[fi].length };
+            offset += fileChunks[fi].length;
             return entry;
         });
 
-        // Concat all file blobs → safenova_efs/workspace.bin
+        // Concat all file blobs → safenova_efs/workspace.bin (single allocation + typed set)
         const workspaceBin = new Uint8Array(offset);
         let wOff = 0;
-        for (const part of blobParts) { workspaceBin.set(part, wOff); wOff += part.length; }
+        for (const chunk of fileChunks) { workspaceBin.set(chunk, wOff); wOff += chunk.length; }
 
         // Encrypt file manifest with the container key
         const manifestJson = JSON.stringify(fileManifest);

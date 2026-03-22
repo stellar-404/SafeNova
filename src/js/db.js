@@ -61,6 +61,23 @@ const DB = (() => {
             tx.oncomplete = () => res();
             tx.onerror = () => rej(tx.error);
         }),
+        // Batch-read specific file records by id array in a single IDB transaction.
+        // Returns a Map<id, record> so callers can look up by id in O(1).
+        getFilesByIds: (ids) => new Promise((res, rej) => {
+            if (!ids || !ids.length) { res(new Map()); return; }
+            const tx = _db.transaction('files', 'readonly');
+            const store = tx.objectStore('files');
+            const result = new Map();
+            let pending = ids.length;
+            ids.forEach(id => {
+                const req = store.get(id);
+                req.onsuccess = () => {
+                    if (req.result) result.set(id, req.result);
+                    if (--pending === 0) res(result);
+                };
+                req.onerror = () => rej(req.error);
+            });
+        }),
 
         /* vfs */
         saveVFS: (cid, iv, blob) => wrap(rw('vfs').put({ cid, iv, blob })),
