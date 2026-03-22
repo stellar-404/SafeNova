@@ -1556,6 +1556,10 @@ function _initTouchDragCommon(area, owner, opts = {}) {
             node = VFS.node(nodeId);
         if (!node) return;
 
+        // Prevent native long-press context menu (Android vibration + touchcancel)
+        // Only when touch lands on an icon — scrolling on empty area stays unaffected.
+        e.preventDefault();
+
         _tdMoved = false; _tdActive = false;
         _tdSX = t.clientX; _tdSY = t.clientY;
         const r = iconEl.getBoundingClientRect();
@@ -1594,7 +1598,7 @@ function _initTouchDragCommon(area, owner, opts = {}) {
             });
             _cancelHoverTooltip();
         }, 400);
-    }, { passive: true });
+    }, { passive: false });
 
     area.addEventListener('touchmove', e => {
         if (e.touches.length !== 1) return;
@@ -1737,11 +1741,13 @@ function _initTouchDragCommon(area, owner, opts = {}) {
 
     area.addEventListener('touchcancel', () => { _tdReset(); }, { passive: true });
 
-    // On Android, long-press fires contextmenu + touchcancel before our 400ms timer.
-    // touchcancel clears el._tsIsTouch so the contextmenu guard in _initAreaTouchHandlers
-    // passes — the menu opens correctly. But if the timer already fired (or a new touch
-    // sequence starts after the menu), drag state must be reset so no ghost drag occurs.
-    area.addEventListener('contextmenu', () => { _tdReset(); });
+    // On Android, long-press fires a native contextmenu event (~500-600ms).
+    // If drag is already active, suppress contextmenu so it doesn't kill the drag.
+    // If drag hasn't started yet (timer still pending), reset to avoid ghost state.
+    area.addEventListener('contextmenu', e => {
+        if (_tdActive) { e.preventDefault(); return; }
+        _tdReset();
+    });
 }
 
 /* ---- Shared rubber-band mouse selection ----
