@@ -10,23 +10,26 @@
    • Survives page refresh within the same tab; dies when the tab
      is closed (sessionStorage is wiped).
 
-   Persistent  (snv-sb-{cid}  in localStorage)  ["Until signed out"]:
+   Persistent  (snv-sb-{cid}  in localStorage)  ["Stay signed in"]:
    • Encrypted with snv-bsk — a shared AES-256-GCM key in localStorage.
-   • The SAME key is available to every tab of the same browser
-     origin, so any tab can resume the session without re-entry.
-   • Survives browser restarts — this is NOT a "browser session";
-     the blob persists until the user explicitly signs out or the
-     7-day TTL baked into the encrypted payload expires.
-   • Trade-off: both key and blob live in localStorage; an
-     attacker with read access to localStorage (e.g. disk image,
-     malware) can decrypt the stored key material.  Use only on
-     a trusted personal device.
+   • snv-bsk itself is AES-GCM-encrypted before being stored — the
+     wrapping key is derived on-the-fly via HKDF from a browser
+     fingerprint (origin, language, hardwareConcurrency, colorDepth)
+     and NEVER written to any storage.  Copying localStorage to a
+     different machine/browser usually produces a different fingerprint
+     → wrap-key differs → snv-bsk undecryptable → blobs opaque.
+     NOTE: navigator.userAgent is intentionally excluded from the
+     fingerprint because Chrome auto-updates silently and would
+     invalidate the session on every update.
+   • Survives browser restarts until the 7-day TTL expires or the
+     user explicitly signs out.
 
    Separation guarantees:
-   • Tab-scope blobs cannot be decrypted by other tabs because
-     snv-sk lives in sessionStorage (not shared across tabs).
-   • Browser-scope blobs are decryptable by all tabs because
-     snv-bsk lives in localStorage (shared across same origin).
+   • Tab-scope blobs → only the originating tab can decrypt them
+     (key in sessionStorage, not shared).
+   • Persistent blobs → any tab of the SAME browser can decrypt
+     them (shared snv-bsk, same fingerprint → same wrap-key).
+   • A copied localStorage is useless without the matching browser.
    ============================================================ */
 
 /* ── Tab-scope session key (sessionStorage, per-tab) ── */
@@ -50,24 +53,83 @@ async function _getOrCreateSessionKey() {
     return _sessionKey;
 }
 
-/* ── Browser-scope session key (localStorage, shared across all tabs) ── */
+/* ── Browser fingerprint → HKDF wrap-key (never stored) ──
+   Derived deterministically from STABLE browser properties.
+   Intentionally excludes navigator.userAgent (changes on every
+   Chrome silent auto-update) and navigator.platform (deprecated).
+   Properties used are stable across browser version updates. */
+let _browserWrapKey = null;
+
+function _getBrowserFingerprint() {
+    const n = navigator, s = screen;
+    return [
+        window.location.origin,              // deployment-bound (stable)
+        n.language            || '',          // system language (rarely changes)
+        String(n.hardwareConcurrency || 0),   // CPU core count (stable)
+        String(s.colorDepth        || 0),     // display bit depth (stable)
+        String(s.pixelDepth        || 0),
+    ].join('\x00');
+}
+
+async function _getOrCreateBrowserWrapKey() {
+    if (_browserWrapKey) return _browserWrapKey;
+    const fpBytes = new TextEncoder().encode(_getBrowserFingerprint());
+    const hkdf = await crypto.subtle.importKey('raw', fpBytes, 'HKDF', false, ['deriveKey']);
+    const salt = new Uint8Array(32); // all-zero deterministic salt
+    const info = new TextEncoder().encode('snv-browser-wrap-v1');
+    _browserWrapKey = await crypto.subtle.deriveKey(
+        { name: 'HKDF', hash: 'SHA-256', salt, info },
+        hkdf,
+        { name: 'AES-GCM', length: 256 },
+        false,
+        ['encrypt', 'decrypt']
+    );
+    return _browserWrapKey;
+}
+
+/* ── Browser-scope session key (localStorage, shared across all tabs, wrap-encrypted) ── */
 let _browserScopeKey = null;
 
 async function _getOrCreateBrowserScopeKey() {
     if (_browserScopeKey) return _browserScopeKey;
+    const wrapKey = await _getOrCreateBrowserWrapKey();
     const stored = localStorage.getItem('snv-bsk');
     if (stored) {
-        try {
-            const raw = Uint8Array.from(atob(stored), ch => ch.charCodeAt(0));
-            _browserScopeKey = await crypto.subtle.importKey('raw', raw, { name: 'AES-GCM' }, false, ['encrypt', 'decrypt']);
-            return _browserScopeKey;
-        } catch { /* corrupted — regenerate below */ }
+        const blobBytes = Uint8Array.from(atob(stored), ch => ch.charCodeAt(0));
+        // Legacy format (pre-fingerprint-wrap): exactly 32 raw bytes, no IV prefix.
+        // Migrate on-the-fly: import the raw key, re-wrap it, overwrite localStorage.
+        if (blobBytes.length === 32) {
+            try {
+                const legacyKey = await crypto.subtle.importKey('raw', blobBytes, { name: 'AES-GCM' }, true, ['encrypt', 'decrypt']);
+                const rawExported = await crypto.subtle.exportKey('raw', legacyKey);
+                const wrapIV = crypto.getRandomValues(new Uint8Array(12));
+                const ct = await crypto.subtle.encrypt({ name: 'AES-GCM', iv: wrapIV }, wrapKey, rawExported);
+                const newBlob = new Uint8Array(12 + ct.byteLength);
+                newBlob.set(wrapIV);
+                newBlob.set(new Uint8Array(ct), 12);
+                localStorage.setItem('snv-bsk', btoa(String.fromCharCode(...newBlob)));
+                _browserScopeKey = await crypto.subtle.importKey('raw', rawExported, { name: 'AES-GCM' }, false, ['encrypt', 'decrypt']);
+                return _browserScopeKey;
+            } catch { /* corrupted legacy key — regenerate below */ }
+        } else {
+            // Current format: IV(12) + AES-GCM(CT) wrapping the 32-byte raw key
+            try {
+                const iv = blobBytes.slice(0, 12), ct = blobBytes.slice(12);
+                const raw = await crypto.subtle.decrypt({ name: 'AES-GCM', iv }, wrapKey, ct);
+                _browserScopeKey = await crypto.subtle.importKey('raw', raw, { name: 'AES-GCM' }, false, ['encrypt', 'decrypt']);
+                return _browserScopeKey;
+            } catch { /* fingerprint changed or corrupted — regenerate below */ }
+        }
     }
+    // Generate fresh snv-bsk and wrap it with the browser-specific key before storing
     const raw = crypto.getRandomValues(new Uint8Array(32));
-    const exp = await crypto.subtle.importKey('raw', raw, { name: 'AES-GCM' }, true, ['encrypt', 'decrypt']);
-    const exported = await crypto.subtle.exportKey('raw', exp);
-    localStorage.setItem('snv-bsk', btoa(String.fromCharCode(...new Uint8Array(exported))));
-    _browserScopeKey = await crypto.subtle.importKey('raw', exported, { name: 'AES-GCM' }, false, ['encrypt', 'decrypt']);
+    const wrapIV = crypto.getRandomValues(new Uint8Array(12));
+    const ct = await crypto.subtle.encrypt({ name: 'AES-GCM', iv: wrapIV }, wrapKey, raw);
+    const blob = new Uint8Array(12 + ct.byteLength);
+    blob.set(wrapIV);
+    blob.set(new Uint8Array(ct), 12);
+    localStorage.setItem('snv-bsk', btoa(String.fromCharCode(...blob)));
+    _browserScopeKey = await crypto.subtle.importKey('raw', raw, { name: 'AES-GCM' }, false, ['encrypt', 'decrypt']);
     return _browserScopeKey;
 }
 

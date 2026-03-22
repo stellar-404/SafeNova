@@ -42,8 +42,7 @@ Key properties:
 | Key derivation  | Argon2id (19 MB memory, 2 iterations, 1 thread)        |
 | File encryption | AES-256-GCM (random 96-bit IV per file)                |
 | VFS encryption  | AES-256-GCM (same key, independent IV)                 |
-| Session tokens  | AES-256-GCM, dual-key: per-tab ephemeral or persistent |
-| Integrity check | AES-256-GCM verification blob authenticated on open    |
+| Session tokens  | AES-256-GCM, dual-key: per-tab ephemeral or persistent || Browser key wrap   | HKDF-SHA-256 from browser fingerprint, never stored   || Integrity check | AES-256-GCM verification blob authenticated on open    |
 
 Every file is encrypted individually — each with its own freshly generated IV. The virtual filesystem (folder tree, file names, sizes, positions) is encrypted as a separate blob using the same derived key. The plaintext password is never stored; only the derived key is held in JavaScript memory for the duration of an active session.
 
@@ -65,14 +64,24 @@ This is the recommended option: the session is automatically gone as soon as the
 
 #### Stay signed in
 
-The key material is encrypted with **`snv-bsk`** — a shared AES-256-GCM key stored in `localStorage`. All tabs of the same browser origin share this key, so:
+The key material is encrypted with **`snv-bsk`** — a shared AES-256-GCM key available to all tabs of the same browser origin.
 
--   Any tab can resume the session without re-entering the password
--   **The session survives browser restarts** — closing the browser and reopening it does not end the session
--   The session expires after **7 days** (TTL baked into the encrypted payload), or immediately when the user explicitly signs out from within the app
--   Clearing browser site data removes both `snv-bsk` and all persistent session blobs
+**Browser-fingerprint key wrapping.** Before `snv-bsk` is written to `localStorage`, it is itself encrypted with a separate *wrap key* that is derived on-the-fly via **HKDF-SHA-256** from a browser fingerprint and **never stored anywhere**:
 
-**Security trade-off:** both `snv-bsk` and the session blob (`snv-sb-{cid}`) reside in `localStorage`. An attacker with read access to `localStorage` — for example via disk imaging or malware on an unattended machine — can decrypt the stored key material. Choose this option only on a trusted personal device.
+```
+fingerprint = userAgent \0 language \0 platform \0 hardwareConcurrency \0 colorDepth \0 pixelDepth
+wrap_key    = HKDF-SHA-256( ikm=fingerprint, salt=0×32, info="snv-browser-wrap-v1" )
+snv-bsk (localStorage) = IV(12) || AES-256-GCM( wrap_key, raw_bsk_bytes )
+```
+
+Consequences:
+
+-   Any tab in the **same browser** recomputes the identical fingerprint → identical wrap key → can decrypt `snv-bsk` and resume the session seamlessly
+-   An attacker who **copies `localStorage`** to another machine (disk image, malware exfil) gets a different `userAgent` / `platform` / etc. → different fingerprint → different wrap key → `snv-bsk` decryption fails → all session blobs become permanently opaque to them
+-   Updating the browser (which changes `userAgent`) invalidates the wrap key. The stored `snv-bsk` can no longer be decrypted; a new one is generated automatically and the user must re-enter the password once
+-   The session expires after **7 days** (TTL baked into the encrypted payload), or immediately on explicit sign-out
+
+**Remaining trade-off:** an attacker with live access to the running browser process (e.g. malicious extension, XSS) can still call the same fingerprint function and derive the wrap key. The browser-fingerprint layer protects against *offline* credential theft (disk images, direct `localStorage` dumps), not against in-browser code execution.
 
 ---
 

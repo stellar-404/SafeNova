@@ -716,7 +716,7 @@ async function doUnlock() {
     document.getElementById('btn-unlock').disabled = true;
 
     try {
-        const key = await Crypto.deriveKey(pw, new Uint8Array(c.salt)),
+        const { key, raw: _sessionRawKey } = await Crypto.deriveKeyAndRaw(pw, new Uint8Array(c.salt)),
             ok = await Crypto.checkVerification(key, c.verIv, c.verBlob);
 
         if (!ok) {
@@ -783,13 +783,12 @@ async function doUnlock() {
         if (typeof _resetAutoLockTimer === 'function') _resetAutoLockTimer();
         Desktop.render();
         toast(`Container "${c.name}" unlocked`, 'success');
-        // Save or clear session based on checkbox
+        // Save or clear session based on checkbox — uses rawKey already derived above (no second Argon2)
         const remEl = document.getElementById('unlock-remember');
         if (remEl && remEl.checked) {
             const scope = document.querySelector('input[name="remember-scope"]:checked')?.value || 'tab';
             try {
-                const rawKey = await Crypto.deriveRaw(pw, new Uint8Array(c.salt));
-                await saveSession(c.id, rawKey, scope);
+                await saveSession(c.id, _sessionRawKey, scope);
             } catch { /* non-critical */ }
         } else {
             // Checkbox unchecked — clear any previously saved session

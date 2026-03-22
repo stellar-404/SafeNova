@@ -28,6 +28,14 @@ const Crypto = (() => {
         );
     }
 
+    // Derives both the CryptoKey and the raw bytes in a single Argon2id pass.
+    // Use instead of calling deriveKey + deriveRaw separately to avoid double hashing.
+    async function deriveKeyAndRaw(password, salt) {
+        const raw = await deriveRaw(password, salt);
+        const key = await crypto.subtle.importKey('raw', raw, { name: 'AES-GCM' }, false, ['encrypt', 'decrypt']);
+        return { key, raw };
+    }
+
     // Import a pre-derived 32-byte key (skips Argon2id for session resume)
     async function importRawKey(rawBytes) {
         return crypto.subtle.importKey(
@@ -77,5 +85,5 @@ const Crypto = (() => {
         } catch { return false; }
     }
 
-    return { deriveRaw, deriveKey, importRawKey, encrypt, decrypt, encryptBin, decryptBin, makeVerification, checkVerification };
+    return { deriveRaw, deriveKey, deriveKeyAndRaw, importRawKey, encrypt, decrypt, encryptBin, decryptBin, makeVerification, checkVerification };
 })();
