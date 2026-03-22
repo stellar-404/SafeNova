@@ -241,7 +241,7 @@ async function downloadFile(node) {
 }
 
 function downloadBuf(buf, name, mime) {
-    const blob = new Blob([buf], { type: mime });
+    const blob = new Blob(Array.isArray(buf) ? buf : [buf], { type: mime });
     const url = URL.createObjectURL(blob);
     const a = document.createElement('a');
     a.href = url; a.download = name; a.click();
@@ -1109,11 +1109,21 @@ function _crc32(data) {
     for (let i = 0; i < data.length; i++) crc = table[(crc ^ data[i]) & 0xFF] ^ (crc >>> 8);
     return (crc ^ 0xFFFFFFFF) >>> 0;
 }
+// Incremental CRC32 over multiple chunks (avoids concatenating large buffers)
+function _crc32multi(chunks) {
+    if (!_crc32._t) _crc32(new Uint8Array(0));
+    const table = _crc32._t;
+    let crc = 0xFFFFFFFF;
+    for (const chunk of chunks)
+        for (let i = 0; i < chunk.length; i++) crc = table[(crc ^ chunk[i]) & 0xFF] ^ (crc >>> 8);
+    return (crc ^ 0xFFFFFFFF) >>> 0;
+}
 
 function _buildZip(entries) {
-    // entries: [ { name: string, data: Uint8Array, mtime?: number } ]
+    // entries: [ { name: string, data: Uint8Array|Uint8Array[], mtime?: number } ]
+    // Returns an array of Uint8Array parts (Blob-friendly, no single giant allocation)
     const enc = new TextEncoder();
-    const locals = [], centralDir = [];
+    const parts = [], centralDir = [];
     let offset = 0;
 
     function dosDT(ts) {
@@ -1126,9 +1136,11 @@ function _buildZip(entries) {
 
     for (const entry of entries) {
         const nm = enc.encode(entry.name);
-        const data = entry.data instanceof Uint8Array ? entry.data : new Uint8Array(entry.data);
-        const crc = _crc32(data);
-        const sz = data.length;
+        const chunks = Array.isArray(entry.data) ? entry.data
+            : [entry.data instanceof Uint8Array ? entry.data : new Uint8Array(entry.data)];
+        const crc = chunks.length === 1 ? _crc32(chunks[0]) : _crc32multi(chunks);
+        let sz = 0;
+        for (const ch of chunks) sz += ch.length;
         const { t: mt, d: md } = dosDT(entry.mtime);
 
         const lh = new Uint8Array(30 + nm.length);
@@ -1139,7 +1151,8 @@ function _buildZip(entries) {
         lv.setUint32(14, crc, true); lv.setUint32(18, sz, true);
         lv.setUint32(22, sz, true); lv.setUint16(26, nm.length, true);
         lv.setUint16(28, 0, true); lh.set(nm, 30);
-        locals.push(lh, data);
+        parts.push(lh);
+        for (const ch of chunks) parts.push(ch);
 
         const cd = new Uint8Array(46 + nm.length);
         const cv = new DataView(cd.buffer);
@@ -1156,17 +1169,14 @@ function _buildZip(entries) {
     }
 
     const cdSz = centralDir.reduce((s, a) => s + a.length, 0);
+    for (const cd of centralDir) parts.push(cd);
     const eocd = new Uint8Array(22);
     const ev = new DataView(eocd.buffer);
     ev.setUint32(0, 0x06054b50, true); ev.setUint16(4, 0, true); ev.setUint16(6, 0, true);
     ev.setUint16(8, entries.length, true); ev.setUint16(10, entries.length, true);
     ev.setUint32(12, cdSz, true); ev.setUint32(16, offset, true); ev.setUint16(20, 0, true);
-
-    const all = [...locals, ...centralDir, eocd];
-    let total = 0; for (const p of all) total += p.length;
-    const out = new Uint8Array(total);
-    let off = 0; for (const p of all) { out.set(p, off); off += p.length; }
-    return out;
+    parts.push(eocd);
+    return parts;
 }
 
 async function exportAsZip(nodeIds, zipName) {
@@ -1199,8 +1209,8 @@ async function exportAsZip(nodeIds, zipName) {
         }));
         decResults.forEach(r => { if (r.status === 'fulfilled' && r.value) entries.push(r.value); });
         if (!entries.length) { toast('Nothing to export', 'warn'); hideLoading(); return; }
-        const zip = _buildZip(entries);
-        downloadBuf(zip.buffer, zipName, 'application/zip');
+        const zipParts = _buildZip(entries);
+        downloadBuf(zipParts, zipName, 'application/zip');
         toast(`Exported ${entries.length} file${entries.length !== 1 ? 's' : ''} as ZIP`, 'success');
         logActivity('export-zip', nodeIds.length === 1 ? (VFS.node(nodeIds[0])?.name ?? entries[0]?.name ?? '1 file') : `${entries.length} files`, entries.length, nodeIds.length === 1 ? VFS.fullPath(nodeIds[0]) : null);
     } catch (e) { toast('ZIP export failed: ' + e.message, 'error'); console.error(e); }
@@ -1289,8 +1299,7 @@ async function exportContainerFile(c, requirePassword = true) {
             fileRecs = await DB.getFilesByCid(c.id),
             now = Date.now();
 
-        // Build file manifest and workspace.bin
-        // Pre-convert blobs once, compute total size in a single pass
+        // Build file manifest — keep blobs as individual chunks (no giant single allocation)
         const fileChunks = fileRecs.map(f => new Uint8Array(f.blob instanceof ArrayBuffer ? f.blob : f.blob));
         let offset = 0;
         const fileManifest = fileRecs.map((f, fi) => {
@@ -1300,11 +1309,6 @@ async function exportContainerFile(c, requirePassword = true) {
             offset += fileChunks[fi].length;
             return entry;
         });
-
-        // Concat all file blobs → safenova_efs/workspace.bin (single allocation + typed set)
-        const workspaceBin = new Uint8Array(offset);
-        let wOff = 0;
-        for (const chunk of fileChunks) { workspaceBin.set(chunk, wOff); wOff += chunk.length; }
 
         // Encrypt file manifest with the container key
         const manifestJson = JSON.stringify(fileManifest);
@@ -1362,7 +1366,7 @@ async function exportContainerFile(c, requirePassword = true) {
             { name: 'meta/1', data: vfsBlobData, mtime: now },
             { name: 'meta/2', data: encManifestIv, mtime: now },
             { name: 'meta/3', data: encManifestBlob, mtime: now },
-            { name: 'safenova_efs/workspace.bin', data: workspaceBin, mtime: now },
+            { name: 'safenova_efs/workspace.bin', data: fileChunks, mtime: now },
         ];
         // Optionally include activity log (encrypted)
         if (c.settings?.exportWithLogs === true) {
@@ -1378,9 +1382,9 @@ async function exportContainerFile(c, requirePassword = true) {
                 entries.push({ name: 'meta/activity_logs/0', data: alogBytes, mtime: now });
             }
         }
-        const zip = _buildZip(entries);
+        const zipParts = _buildZip(entries);
         const dateStr = new Date(now).toISOString().slice(0, 10);
-        downloadBuf(zip.buffer, `SafeNova_${c.name}_${dateStr}.safenova`, 'application/octet-stream');
+        downloadBuf(zipParts, `SafeNova_${c.name}_${dateStr}.safenova`, 'application/octet-stream');
         toast(`Container "${c.name}" exported`, 'success');
         logActivity('export-container', c.name);
     } catch (e) { toast('Export failed: ' + e.message, 'error'); console.error(e); }
