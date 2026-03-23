@@ -28,8 +28,8 @@ let _activityLog = []; // in-memory ring buffer; never stored raw on the contain
 
 // ── Compression (deflate, built-in, zero-dependency) ────────
 async function _compressLog(arr) {
-    const json = JSON.stringify(arr);
-    const cs = new Blob([json]).stream().pipeThrough(new CompressionStream('deflate'));
+    const json = JSON.stringify(arr),
+        cs = new Blob([json]).stream().pipeThrough(new CompressionStream('deflate'));
     return new Uint8Array(await new Response(cs).arrayBuffer());
 }
 async function _decompressLog(bytes) {
@@ -766,15 +766,15 @@ function _resolveScanRow(row, status, detail) {
 async function _runDbChecks(repair, isAborted) {
     const steps = [];
     function mkStep(name, iss, fxd) {
-        const hasCrit = iss.some(i => i.sev === 'critical');
-        const status = iss.length === 0 ? 'pass' : hasCrit ? 'fail' : 'warn';
-        const detail = iss.length === 0 ? 'OK' : `${iss.length} issue${iss.length !== 1 ? 's' : ''}${repair && fxd.length ? `, ${fxd.length} fixed` : ''}`;
+        const hasCrit = iss.some(i => i.sev === 'critical'),
+            status = iss.length === 0 ? 'pass' : hasCrit ? 'fail' : 'warn',
+            detail = iss.length === 0 ? 'OK' : `${iss.length} issue${iss.length !== 1 ? 's' : ''}${repair && fxd.length ? `, ${fxd.length} fixed` : ''}`;
         steps.push({ name, status, detail, issues: iss, fixed: fxd });
     }
 
     // Build the DB file map once (expensive IndexedDB call)
-    const allDbFiles = await DB.getFilesByCid(App.container.id);
-    const dbFileMap = new Map(allDbFiles.map(f => [f.id, f]));
+    const allDbFiles = await DB.getFilesByCid(App.container.id),
+        dbFileMap = new Map(allDbFiles.map(f => [f.id, f]));
 
     // Snapshot VFS file IDs — refresh after each destructive step
     let vfsFileIds = new Set(VFS.fileIds());
@@ -997,11 +997,11 @@ function _openScannerModal() {
         _aborted = false;
 
         // Show 5 progress rows updated via onProgress callback
-        const rowStorage = _addScanRow(log, 'Scanning storage records…');
-        const rowPurge = _addScanRow(log, 'Purging dead nodes…');
-        const rowFlatten = _addScanRow(log, 'Flattening deep folder chains…');
-        const rowMeta = _addScanRow(log, 'Repairing metadata…');
-        const rowClean = _addScanRow(log, 'Cleaning storage records…');
+        const rowStorage = _addScanRow(log, 'Scanning storage records…'),
+            rowPurge    = _addScanRow(log, 'Purging dead nodes…'),
+            rowFlatten  = _addScanRow(log, 'Flattening deep folder chains…'),
+            rowMeta     = _addScanRow(log, 'Repairing metadata…'),
+            rowClean    = _addScanRow(log, 'Cleaning storage records…');
         log.scrollTop = log.scrollHeight;
         await _delay(20);
 
@@ -1147,8 +1147,8 @@ async function _runDeepClean(isAborted, onProgress) {
     const dbIds = new Set(allDbFiles.map(f => f.id));
 
     // 2. Determine truly live file IDs: exist in VFS AND have a DB record
-    const allVfsFileIds = VFS.fileIds();
-    const liveFileIds = allVfsFileIds.filter(id => dbIds.has(id));
+    const allVfsFileIds = VFS.fileIds(),
+        liveFileIds = allVfsFileIds.filter(id => dbIds.has(id));
     if (_abort()) return { removed: 0 };
 
     // 3. Single-pass bulk purge via VFS.purgeDeadBranches (O(n))

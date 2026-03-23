@@ -54,9 +54,9 @@ async function _getOrCreateSessionKey() {
             return _sessionKey;
         } catch { /* corrupted — regenerate below */ }
     }
-    const raw = crypto.getRandomValues(new Uint8Array(32));
-    const exp = await crypto.subtle.importKey('raw', raw, { name: 'AES-GCM' }, true, ['encrypt', 'decrypt']);
-    const exported = await crypto.subtle.exportKey('raw', exp);
+    const raw = crypto.getRandomValues(new Uint8Array(32)),
+        exp = await crypto.subtle.importKey('raw', raw, { name: 'AES-GCM' }, true, ['encrypt', 'decrypt']),
+        exported = await crypto.subtle.exportKey('raw', exp);
     sessionStorage.setItem('snv-sk', btoa(String.fromCharCode(...new Uint8Array(exported))));
     _sessionKey = await crypto.subtle.importKey('raw', exported, { name: 'AES-GCM' }, false, ['encrypt', 'decrypt']);
     return _sessionKey;
@@ -97,8 +97,8 @@ function _readKeyPartCookie() {
 }
 
 function _writeKeyPartCookie(b64) {
-    const maxAge = 400 * 24 * 60 * 60; // ~400 days (browser max-age ceiling)
-    const secure = location.protocol === 'https:' ? '; Secure' : '';
+    const maxAge = 400 * 24 * 60 * 60, // ~400 days (browser max-age ceiling)
+        secure = location.protocol === 'https:' ? '; Secure' : '';
     document.cookie = `snv-kc=${b64}; path=/; max-age=${maxAge}; SameSite=Strict${secure}`;
 }
 
@@ -131,8 +131,8 @@ async function _getOrCreateKeyPartIDB() {
     return new Promise((resolve, reject) => {
         const timer = setTimeout(() => reject(new Error('SafeNovaKS open timeout')), _KS_TIMEOUT);
         let settled = false;
-        const done = (v)  => { if (!settled) { settled = true; clearTimeout(timer); InitLog.done('wrap-key: SafeNovaKS IDB'); resolve(v); } };
-        const fail = (e)  => { if (!settled) { settled = true; clearTimeout(timer); InitLog.error('wrap-key: SafeNovaKS IDB', e); reject(e);  } };
+        const done = (v)  => { if (!settled) { settled = true; clearTimeout(timer); InitLog.done('wrap-key: SafeNovaKS IDB'); resolve(v); } },
+              fail = (e)  => { if (!settled) { settled = true; clearTimeout(timer); InitLog.error('wrap-key: SafeNovaKS IDB', e); reject(e);  } };
 
         let db;
         try {
@@ -149,8 +149,8 @@ async function _getOrCreateKeyPartIDB() {
             req.onsuccess = e => {
                 try {
                     db = e.target.result;
-                    const tx = db.transaction('keys', 'readonly');
-                    const get = tx.objectStore('keys').get('snv-ki');
+                    const tx = db.transaction('keys', 'readonly'),
+                        get = tx.objectStore('keys').get('snv-ki');
                     get.onsuccess = () => {
                         try {
                             const rec = get.result;
@@ -210,9 +210,9 @@ async function _getOrCreateBrowserWrapKey() {
     combined[fpBytes.length + 1 + 32] = 0;
     combined.set(idbPart, fpBytes.length + 1 + 32 + 1);
 
-    const hkdf = await crypto.subtle.importKey('raw', combined, 'HKDF', false, ['deriveKey']);
-    const salt = new Uint8Array(32); // all-zero deterministic salt
-    const info = new TextEncoder().encode('snv-browser-wrap-v2');
+    const hkdf = await crypto.subtle.importKey('raw', combined, 'HKDF', false, ['deriveKey']),
+        salt = new Uint8Array(32), // all-zero deterministic salt
+        info = new TextEncoder().encode('snv-browser-wrap-v2');
     _browserWrapKey = await crypto.subtle.deriveKey(
         { name: 'HKDF', hash: 'SHA-256', salt, info },
         hkdf,
@@ -247,11 +247,11 @@ async function _getOrCreateBrowserScopeKey() {
         // Migrate on-the-fly: import the raw key, re-wrap it, overwrite localStorage.
         if (blobBytes.length === 32) {
             try {
-                const legacyKey = await crypto.subtle.importKey('raw', blobBytes, { name: 'AES-GCM' }, true, ['encrypt', 'decrypt']);
-                const rawExported = await crypto.subtle.exportKey('raw', legacyKey);
-                const wrapIV = crypto.getRandomValues(new Uint8Array(12));
-                const ct = await crypto.subtle.encrypt({ name: 'AES-GCM', iv: wrapIV }, wrapKey, rawExported);
-                const newBlob = new Uint8Array(12 + ct.byteLength);
+                const legacyKey = await crypto.subtle.importKey('raw', blobBytes, { name: 'AES-GCM' }, true, ['encrypt', 'decrypt']),
+                    rawExported = await crypto.subtle.exportKey('raw', legacyKey),
+                    wrapIV = crypto.getRandomValues(new Uint8Array(12)),
+                    ct = await crypto.subtle.encrypt({ name: 'AES-GCM', iv: wrapIV }, wrapKey, rawExported),
+                    newBlob = new Uint8Array(12 + ct.byteLength);
                 newBlob.set(wrapIV);
                 newBlob.set(new Uint8Array(ct), 12);
                 localStorage.setItem('snv-bsk', btoa(String.fromCharCode(...newBlob)));
@@ -271,10 +271,10 @@ async function _getOrCreateBrowserScopeKey() {
         }
     }
     // Generate fresh snv-bsk and wrap it with the browser-specific key before storing
-    const raw = crypto.getRandomValues(new Uint8Array(32));
-    const wrapIV = crypto.getRandomValues(new Uint8Array(12));
-    const ct = await crypto.subtle.encrypt({ name: 'AES-GCM', iv: wrapIV }, wrapKey, raw);
-    const blob = new Uint8Array(12 + ct.byteLength);
+    const raw = crypto.getRandomValues(new Uint8Array(32)),
+        wrapIV = crypto.getRandomValues(new Uint8Array(12)),
+        ct = await crypto.subtle.encrypt({ name: 'AES-GCM', iv: wrapIV }, wrapKey, raw),
+        blob = new Uint8Array(12 + ct.byteLength);
     blob.set(wrapIV);
     blob.set(new Uint8Array(ct), 12);
     localStorage.setItem('snv-bsk', btoa(String.fromCharCode(...blob)));
@@ -287,25 +287,25 @@ async function _getOrCreateBrowserScopeKey() {
 const SESSION_TTL_BROWSER = 7 * 24 * 60 * 60 * 1000;
 
 async function _encryptSessionPayload(key, cid, rawKeyBytes, expiryMs) {
-    const iv = crypto.getRandomValues(new Uint8Array(12));
-    const payload = new Uint8Array(8 + rawKeyBytes.length);
+    const iv = crypto.getRandomValues(new Uint8Array(12)),
+        payload = new Uint8Array(8 + rawKeyBytes.length);
     new DataView(payload.buffer).setBigUint64(0, BigInt(expiryMs), true);
     payload.set(rawKeyBytes, 8);
-    const aad = new TextEncoder().encode('snv-session:' + cid);
-    const ct = await crypto.subtle.encrypt({ name: 'AES-GCM', iv, additionalData: aad }, key, payload);
-    const blob = new Uint8Array(12 + ct.byteLength);
+    const aad = new TextEncoder().encode('snv-session:' + cid),
+        ct = await crypto.subtle.encrypt({ name: 'AES-GCM', iv, additionalData: aad }, key, payload),
+        blob = new Uint8Array(12 + ct.byteLength);
     blob.set(iv);
     blob.set(new Uint8Array(ct), 12);
     return btoa(String.fromCharCode(...blob));
 }
 
 async function _decryptSessionPayload(key, cid, b64) {
-    const blob = Uint8Array.from(atob(b64), ch => ch.charCodeAt(0));
-    const iv = blob.slice(0, 12), ct = blob.slice(12);
-    const aad = new TextEncoder().encode('snv-session:' + cid);
-    const dec = await crypto.subtle.decrypt({ name: 'AES-GCM', iv, additionalData: aad }, key, ct);
-    const payload = new Uint8Array(dec);
-    const expiry = Number(new DataView(payload.buffer).getBigUint64(0, true));
+    const blob = Uint8Array.from(atob(b64), ch => ch.charCodeAt(0)),
+        iv = blob.slice(0, 12), ct = blob.slice(12);
+    const aad = new TextEncoder().encode('snv-session:' + cid),
+        dec = await crypto.subtle.decrypt({ name: 'AES-GCM', iv, additionalData: aad }, key, ct),
+        payload = new Uint8Array(dec),
+        expiry = Number(new DataView(payload.buffer).getBigUint64(0, true));
     if (Date.now() > expiry) return null; // expired
     return payload.slice(8); // 32-byte raw key material
 }
@@ -314,14 +314,14 @@ async function _decryptSessionPayload(key, cid, b64) {
 async function saveSession(cid, rawKeyBytes, scope) {
     if (scope === 'browser') {
         // Use the shared browser-scope key so ALL tabs can resume this session
-        const key = await _getOrCreateBrowserScopeKey();
-        const b64 = await _encryptSessionPayload(key, cid, rawKeyBytes, Date.now() + SESSION_TTL_BROWSER);
+        const key = await _getOrCreateBrowserScopeKey(),
+            b64 = await _encryptSessionPayload(key, cid, rawKeyBytes, Date.now() + SESSION_TTL_BROWSER);
         localStorage.setItem('snv-sb-' + cid, b64);
         sessionStorage.removeItem('snv-s-' + cid);
     } else {
         // Use the per-tab key; only this tab can decrypt it
-        const key = await _getOrCreateSessionKey();
-        const b64 = await _encryptSessionPayload(key, cid, rawKeyBytes, Number.MAX_SAFE_INTEGER);
+        const key = await _getOrCreateSessionKey(),
+            b64 = await _encryptSessionPayload(key, cid, rawKeyBytes, Number.MAX_SAFE_INTEGER);
         sessionStorage.setItem('snv-s-' + cid, b64);
         localStorage.removeItem('snv-sb-' + cid);
     }
@@ -608,8 +608,8 @@ async function updateStorageInfo() {
         const displayMax = Math.min(quota > 0 ? quota : DEVICE_LIMIT, DEVICE_LIMIT),
             pct = displayMax > 0 ? Math.min((used / displayMax) * 100, 100) : 0;
 
-        const fill = document.getElementById('storage-bar-fill');
-        const txt = document.getElementById('storage-text');
+        const fill = document.getElementById('storage-bar-fill'),
+            txt = document.getElementById('storage-text');
         if (fill) {
             fill.style.width = pct + '%';
             fill.className = 'storage-bar-fill' + (pct > 90 ? ' danger' : pct > 70 ? ' warn' : '');
@@ -643,11 +643,11 @@ async function updateStorageInfo() {
         }
 
         // TrueWebCrypt containers usage
-        const containers = await DB.getContainers();
-        const twcUsed = containers.reduce((s, c) => s + (c.totalSize || 0), 0);
-        const twcPct = displayMax > 0 ? Math.min((twcUsed / displayMax) * 100, 100) : 0;
-        const twcFill = document.getElementById('twc-bar-fill');
-        const twcTxt = document.getElementById('twc-text');
+        const containers = await DB.getContainers(),
+            twcUsed = containers.reduce((s, c) => s + (c.totalSize || 0), 0),
+            twcPct = displayMax > 0 ? Math.min((twcUsed / displayMax) * 100, 100) : 0,
+            twcFill = document.getElementById('twc-bar-fill'),
+            twcTxt = document.getElementById('twc-text');
         if (twcFill) twcFill.style.width = twcPct + '%';
         if (twcTxt) twcTxt.textContent = `${fmtSize(twcUsed)} in ${containers.length} container${containers.length !== 1 ? 's' : ''}`;
     } catch (e) { /* silently ignore — storage API may be restricted */ }

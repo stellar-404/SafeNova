@@ -45,8 +45,8 @@ const _TAB_ID = (() => {
 
 function fmtSize(b) {
     if (b === 0) return '0 B';
-    const k = 1024, s = ['B', 'KB', 'MB', 'GB', 'TB'];
-    const i = Math.min(Math.floor(Math.log(b) / Math.log(k)), s.length - 1);
+    const k = 1024, s = ['B', 'KB', 'MB', 'GB', 'TB'],
+        i = Math.min(Math.floor(Math.log(b) / Math.log(k)), s.length - 1);
     return (b / Math.pow(k, i)).toFixed(i > 0 ? 1 : 0) + ' ' + s[i];
 }
 
@@ -99,8 +99,8 @@ function isVideo(mime) { return mime.startsWith('video/'); }
 function isPDF(mime) { return mime === 'application/pdf'; }
 
 function buf2b64(buf) {
-    const u8 = buf instanceof Uint8Array ? buf : new Uint8Array(buf);
-    const CHUNK = 8192;
+    const u8 = buf instanceof Uint8Array ? buf : new Uint8Array(buf),
+        CHUNK = 8192;
     let s = '';
     for (let i = 0; i < u8.length; i += CHUNK)
         s += String.fromCharCode.apply(null, u8.subarray(i, Math.min(i + CHUNK, u8.length)));
