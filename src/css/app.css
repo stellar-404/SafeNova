@@ -1376,7 +1376,29 @@ body.no-animations * {
     flex: 1;
     overflow: hidden;
     display: flex;
-    flex-direction: column;
+    flex-direction: row;
+}
+.editor-line-numbers {
+    flex-shrink: 0;
+    width: 48px;
+    overflow: hidden;
+    padding: 16px 0;
+    background: var(--bg3);
+    border-right: 1px solid var(--border);
+    font-family: var(--mono);
+    font-size: 13px;
+    line-height: 1.6;
+    color: var(--text-dim);
+    user-select: none;
+    -webkit-user-select: none;
+}
+.editor-line-numbers > div {
+    padding-right: 8px;
+    text-align: right;
+    white-space: nowrap;
+    display: flex;
+    align-items: flex-start;
+    justify-content: flex-end;
 }
 .editor-meta {
     padding: 6px 12px;
