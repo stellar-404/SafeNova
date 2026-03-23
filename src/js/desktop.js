@@ -121,9 +121,9 @@ function _alogPathDisplay(p) {
     if (!p) return '';
     const segs = p.split('/').filter(Boolean); // ['~', 'Container', 'a', 'b', 'file']
     if (p.length <= 58 || segs.length <= 4) return p;
-    const prefix = '/~/' + segs[1] + '/\u2026/';
-    const tail = segs.slice(-2).join('/') + (p.endsWith('/') ? '/' : '');
-    const result = prefix + tail;
+    const prefix = '/~/' + segs[1] + '/\u2026/',
+        tail = segs.slice(-2).join('/') + (p.endsWith('/') ? '/' : ''),
+        result = prefix + tail;
     // If still too long, keep only the last segment
     return result.length <= 62 ? result : prefix + segs[segs.length - 1] + (p.endsWith('/') ? '/' : '');
 }
@@ -998,10 +998,10 @@ function _openScannerModal() {
 
         // Show 5 progress rows updated via onProgress callback
         const rowStorage = _addScanRow(log, 'Scanning storage records…'),
-            rowPurge    = _addScanRow(log, 'Purging dead nodes…'),
-            rowFlatten  = _addScanRow(log, 'Flattening deep folder chains…'),
-            rowMeta     = _addScanRow(log, 'Repairing metadata…'),
-            rowClean    = _addScanRow(log, 'Cleaning storage records…');
+            rowPurge = _addScanRow(log, 'Purging dead nodes…'),
+            rowFlatten = _addScanRow(log, 'Flattening deep folder chains…'),
+            rowMeta = _addScanRow(log, 'Repairing metadata…'),
+            rowClean = _addScanRow(log, 'Cleaning storage records…');
         log.scrollTop = log.scrollHeight;
         await _delay(20);
 
@@ -1519,7 +1519,7 @@ function _syncAreaWidth(area) {
         if (r > maxRight) maxRight = r;
         if (b > maxBottom) maxBottom = b;
     }
-    canvas.style.width  = maxRight  > 0 ? (maxRight  + 24) + 'px' : '';
+    canvas.style.width = maxRight > 0 ? (maxRight + 24) + 'px' : '';
     canvas.style.height = maxBottom > 0 ? (maxBottom + 24) + 'px' : '';
 }
 

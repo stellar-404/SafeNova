@@ -83,10 +83,10 @@ function _getBrowserFingerprint() {
     const n = navigator, s = screen;
     return [
         window.location.origin,              // deployment-bound (stable)
-        n.language            || '',          // system language (rarely changes)
+        n.language || '',          // system language (rarely changes)
         String(n.hardwareConcurrency || 0),   // CPU core count (stable)
-        String(s.colorDepth        || 0),     // display bit depth (stable)
-        String(s.pixelDepth        || 0),
+        String(s.colorDepth || 0),     // display bit depth (stable)
+        String(s.pixelDepth || 0),
     ].join('\x00');
 }
 
@@ -131,8 +131,8 @@ async function _getOrCreateKeyPartIDB() {
     return new Promise((resolve, reject) => {
         const timer = setTimeout(() => reject(new Error('SafeNovaKS open timeout')), _KS_TIMEOUT);
         let settled = false;
-        const done = (v)  => { if (!settled) { settled = true; clearTimeout(timer); InitLog.done('wrap-key: SafeNovaKS IDB'); resolve(v); } },
-              fail = (e)  => { if (!settled) { settled = true; clearTimeout(timer); InitLog.error('wrap-key: SafeNovaKS IDB', e); reject(e);  } };
+        const done = (v) => { if (!settled) { settled = true; clearTimeout(timer); InitLog.done('wrap-key: SafeNovaKS IDB'); resolve(v); } },
+            fail = (e) => { if (!settled) { settled = true; clearTimeout(timer); InitLog.error('wrap-key: SafeNovaKS IDB', e); reject(e); } };
 
         let db;
         try {
@@ -145,7 +145,7 @@ async function _getOrCreateKeyPartIDB() {
                 } catch (err) { fail(err); }
             };
             req.onblocked = () => fail(new Error('SafeNovaKS blocked'));
-            req.onerror   = () => fail(req.error);
+            req.onerror = () => fail(req.error);
             req.onsuccess = e => {
                 try {
                     db = e.target.result;
@@ -159,7 +159,7 @@ async function _getOrCreateKeyPartIDB() {
                             const val = rec?.value;
                             const bytes = val instanceof Uint8Array ? val
                                 : val instanceof ArrayBuffer ? new Uint8Array(val)
-                                : (val?.buffer instanceof ArrayBuffer ? new Uint8Array(val.buffer) : null);
+                                    : (val?.buffer instanceof ArrayBuffer ? new Uint8Array(val.buffer) : null);
                             if (bytes && bytes.length === 32) {
                                 db.close();
                                 done(bytes);
@@ -168,12 +168,12 @@ async function _getOrCreateKeyPartIDB() {
                                 const tx2 = db.transaction('keys', 'readwrite');
                                 tx2.objectStore('keys').put({ id: 'snv-ki', value: bytes });
                                 tx2.oncomplete = () => { db.close(); done(bytes); };
-                                tx2.onerror    = () => { db.close(); fail(tx2.error); };
+                                tx2.onerror = () => { db.close(); fail(tx2.error); };
                             }
-                        } catch (err) { try { db.close(); } catch {} fail(err); }
+                        } catch (err) { try { db.close(); } catch { } fail(err); }
                     };
-                    get.onerror = () => { try { db.close(); } catch {} fail(get.error); };
-                } catch (err) { try { db?.close(); } catch {} fail(err); }
+                    get.onerror = () => { try { db.close(); } catch { } fail(get.error); };
+                } catch (err) { try { db?.close(); } catch { } fail(err); }
             };
         } catch (err) { fail(err); }
     });

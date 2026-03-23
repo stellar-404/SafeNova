@@ -28,6 +28,7 @@ Key properties:
 -   **Container import / export** — portable `.safenova` container files; import reads the archive via streaming `File.slice()` without loading the full file into memory, making multi-gigabyte imports possible; export streams data chunk-by-chunk requiring no single contiguous allocation regardless of container size
 -   **Export password guard** — configurable setting (on by default) to require password confirmation before exporting; when disabled, active-session key is used directly
 -   **Sort & arrange** — sort icons by name, date, size, or type; drag to custom positions
+-   **Secure container deletion** — before permanent erasure, the first 8 bytes of every encrypted blob are overwritten with zeros (cryptographic pre-shredding), ensuring the AES-GCM ciphertext is irrecoverable even on storage media that lazily reclaims pages
 -   **Container integrity scanner** — 27 automated checks (21 VFS structural + 6 database-level) with one-click auto-repair, **Deep Clean** (flattens over-nested folder trees, repairs all metadata), and a backup prompt before any destructive operation
 -   **Settings** — three tabs: personalization, statistics, activity logs
 -   **Keyboard shortcuts** — `Delete`, `F2`, `Ctrl+A`, `Ctrl+C/X/V`, `Ctrl+S` (save in editor), `Escape`
@@ -210,6 +211,7 @@ SafeNova/
 3. Files you upload are encrypted with AES-256-GCM before being saved to IndexedDB
 4. The virtual filesystem (folder tree + icon positions) is also encrypted and saved separately
 5. **Lock** the container — the derived key is immediately wiped from memory
+6. **Delete** the container — first, the first 8 bytes of every encrypted blob are overwritten with zeros (cryptographic pre-shredding); then all encrypted records, the VFS blob, and the container metadata are permanently deleted from IndexedDB
 
 All container data is scoped to the current browser and device. Use **Export Container** to back up or transfer to another device.
 

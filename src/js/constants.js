@@ -84,8 +84,8 @@ function getMime(name) {
         ppt: 'application/vnd.ms-powerpoint',
         pptx: 'application/vnd.openxmlformats-officedocument.presentationml.presentation',
         woff: 'font/woff', woff2: 'font/woff2', ttf: 'font/ttf', otf: 'font/otf',
-        arj:  'application/x-arj', dbf: 'application/x-dbf',
-        so:  'application/x-sharedlib'
+        arj: 'application/x-arj', dbf: 'application/x-dbf',
+        so: 'application/x-sharedlib'
     })[e] || 'application/octet-stream';
 }
 
@@ -129,7 +129,7 @@ function escHtml(str) {
 }
 
 /* Shared error/cooldown SVG fragments reused across all password forms */
-const _ERR_SVG  = '<svg width="14" height="14" viewBox="0 0 16 16" fill="none"><path d="M8 1.5a6.5 6.5 0 100 13 6.5 6.5 0 000-13zM7.25 5h1.5v4h-1.5V5zm0 5h1.5v1.5h-1.5V10z" fill="currentColor"/></svg>';
+const _ERR_SVG = '<svg width="14" height="14" viewBox="0 0 16 16" fill="none"><path d="M8 1.5a6.5 6.5 0 100 13 6.5 6.5 0 000-13zM7.25 5h1.5v4h-1.5V5zm0 5h1.5v1.5h-1.5V10z" fill="currentColor"/></svg>';
 const _WAIT_SVG = '<svg width="14" height="14" viewBox="0 0 14 14" fill="none"><circle cx="7" cy="7" r="6" stroke="currentColor" stroke-width="1.3"/><path d="M7 4v3.5l2.5 1.5" stroke="currentColor" stroke-width="1.3" stroke-linecap="round"/></svg>';
 
 /* Shared brute-force cooldown — disables btn and shows 3-second countdown in errEl */

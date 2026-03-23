@@ -14,7 +14,7 @@ const DB = (() => {
                 if (!settled) { settled = true; InitLog.error('DB open (SafeNovaEFS)', 'timeout'); rej(new Error('SafeNovaEFS open timeout')); }
             }, 8000);
             const done = (db) => { if (!settled) { settled = true; clearTimeout(timer); _db = db; InitLog.done('DB open (SafeNovaEFS)'); res(); } };
-            const fail = (e)  => { if (!settled) { settled = true; clearTimeout(timer); InitLog.error('DB open (SafeNovaEFS)', e); rej(e); } };
+            const fail = (e) => { if (!settled) { settled = true; clearTimeout(timer); InitLog.error('DB open (SafeNovaEFS)', e); rej(e); } };
 
             const req = indexedDB.open(DB_NAME, DB_VERSION);
             req.onupgradeneeded = e => {
@@ -38,7 +38,7 @@ const DB = (() => {
                 } catch (err) { InitLog.error('DB schema upgrade', err); fail(err); }
             };
             req.onsuccess = e => done(e.target.result);
-            req.onerror   = () => fail(req.error);
+            req.onerror = () => fail(req.error);
             req.onblocked = () => {
                 // Another connection prevents upgrade; close it by requesting versionchange on self
                 InitLog.error('DB open (SafeNovaEFS)', 'blocked — waiting for other connections to close');
@@ -77,6 +77,44 @@ const DB = (() => {
                 };
                 req.onerror = () => reject(req.error);
             }
+        });
+    }
+
+    // Pre-deletion corruption: overwrite the first 8 bytes of every encrypted blob with zeros.
+    // This ensures ciphertext is irrecoverable even if the storage engine doesn't
+    // immediately reclaim the underlying pages. Best-effort — always resolves so deletion proceeds.
+    function _corruptFileBlobs(ids) {
+        return new Promise((resolve) => {
+            if (!ids.length) { resolve(); return; }
+            const tx = _db.transaction(['files', 'chunks'], 'readwrite'),
+                fs = tx.objectStore('files'),
+                cs = tx.objectStore('chunks');
+            tx.oncomplete = () => resolve();
+            tx.onerror = (e) => { e.preventDefault(); resolve(); };
+            tx.onabort = () => resolve();
+            ids.forEach(id => {
+                const req = fs.get(id);
+                req.onsuccess = () => {
+                    const rec = req.result;
+                    if (rec?._chunked) {
+                        // Large file: corrupt first 8 bytes of the first chunk
+                        const cr = cs.get(id + '_0');
+                        cr.onsuccess = () => {
+                            const chunk = cr.result;
+                            if (chunk?.data) {
+                                new Uint8Array(chunk.data, 0, Math.min(8, chunk.data.byteLength)).fill(0);
+                                cs.put(chunk);
+                            }
+                        };
+                        cr.onerror = (e) => e.preventDefault();
+                    } else if (rec?.blob) {
+                        // Inline file: corrupt first 8 bytes of the blob
+                        new Uint8Array(rec.blob, 0, Math.min(8, rec.blob.byteLength)).fill(0);
+                        fs.put(rec);
+                    }
+                };
+                req.onerror = (e) => e.preventDefault();
+            });
         });
     }
 
@@ -241,7 +279,7 @@ const DB = (() => {
         getVFS: (cid) => wrap(ro('vfs').get(cid)),
         deleteVFS: (cid) => wrap(rw('vfs').delete(cid)),
 
-        /* nuke container — deletes everything (uses key cursor to avoid deserializing large blobs) */
+        /* nuke container — corrupts blobs, then deletes everything (uses key cursor to avoid deserializing large blobs) */
         async nukeContainer(cid) {
             const ids = await new Promise((resolve, reject) => {
                 const tx = _db.transaction('files', 'readonly'),
@@ -251,7 +289,10 @@ const DB = (() => {
                 req.onsuccess = () => { const c = req.result; if (!c) { resolve(r); return; } r.push(c.primaryKey); c.continue(); };
                 req.onerror = () => reject(req.error);
             });
-            if (ids.length) await this.deleteFiles(ids);
+            if (ids.length) {
+                await _corruptFileBlobs(ids); // zero-overwrite first 8 bytes of each encrypted blob
+                await this.deleteFiles(ids);
+            }
             await this.deleteVFS(cid);
             await this.deleteContainer(cid);
         }
