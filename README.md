@@ -25,7 +25,7 @@ Key properties:
 -   **Hardware key support** — optionally use a WebAuthn passkey to strengthen the container salt
 -   **Session memory** — optionally remember your session per tab (ephemeral, recommended) or persistently until manually signed out, using AES-GCM-encrypted session tokens; persistent sessions survive browser restarts
 -   **Cross-tab session protection** — a container can only be actively open in one browser tab at a time; a lightweight lock protocol detects conflicts and offers instant session takeover
--   **Container import / export** — portable `.safenova` container files; import is instantaneous (lazy workspace expansion on first unlock), export streams data chunk-by-chunk requiring no single contiguous allocation regardless of container size
+-   **Container import / export** — portable `.safenova` container files; import reads the archive via streaming `File.slice()` without loading the full file into memory, making multi-gigabyte imports possible; export streams data chunk-by-chunk requiring no single contiguous allocation regardless of container size
 -   **Export password guard** — configurable setting (on by default) to require password confirmation before exporting; when disabled, active-session key is used directly
 -   **Sort & arrange** — sort icons by name, date, size, or type; drag to custom positions
 -   **Container integrity scanner** — 27 automated checks (21 VFS structural + 6 database-level) with one-click auto-repair, **Deep Clean** (flattens over-nested folder trees, repairs all metadata), and a backup prompt before any destructive operation
@@ -147,16 +147,17 @@ SafeNova/
 │   └── app.css         # All application styles
 │
 └── js/
-    ├── argon2.umd.min.js  # Argon2id WASM/JS implementation
-    ├── constants.js       # Shared constants, utilities, icon SVGs
-    ├── state.js           # App state singleton (key, container, session)
+    ├── argon2.umd.min.js  # Argon2id WASM/JS implementation (hashwasm)
+    ├── initlog.js         # Initialization stage console logger (InitLog)
+    ├── constants.js       # Shared constants (DB names, limits, chunk size), utilities, icon SVGs
+    ├── db.js              # IndexedDB abstraction — SafeNovaEFS (containers / files / vfs / chunks stores)
     ├── crypto.js          # AES-256-GCM + Argon2id encryption layer
-    ├── db.js              # IndexedDB abstraction (containers / files / vfs)
-    ├── vfs.js             # In-memory virtual filesystem
-    ├── fileops.js         # Upload, download, copy/paste, rename, delete
-    ├── home.js            # Container management (create, unlock, import, export)
-    ├── main.js            # Event binding and app boot
-    └── desktop.js         # Desktop UI — icons, folder windows, drag & drop
+    ├── vfs.js             # In-memory virtual filesystem (nodes, positions, child index)
+    ├── state.js           # App state singleton — key, session encrypt/decrypt, three-source wrap key
+    ├── home.js            # Container management: create, unlock, import, export, change password
+    ├── desktop.js         # Desktop UI: icons, folder windows, drag & drop, integrity scanner
+    ├── fileops.js         # File operations: upload, download, open, copy/paste, rename, delete, ZIP export
+    └── main.js            # App boot, event binding, console security warning
 ```
 
 ---
@@ -197,7 +198,7 @@ The only identifiable plaintext in the archive is the container name in `contain
 
 #### Lazy import
 
-A `.safenova` file can be imported without entering the container password. The encrypted workspace is stored as-is internally, flagged as a `lazyWorkspace`. It is expanded into the local database only on first unlock — so import is instantaneous regardless of container size.
+A `.safenova` file can be imported without entering the container password. The archive is parsed via `File.slice()` — only the ZIP directory and small metadata entries are fully read into memory; the `workspace.bin` payload is handled as a `Blob` reference. The encrypted workspace is stored as-is internally, flagged as a `lazyWorkspace`. It is expanded into the local database only on first unlock — so import is instantaneous regardless of container size.
 
 #### Self-authenticating
 
@@ -225,7 +226,7 @@ This serves as the default batch width for all bulk encrypt/decrypt loops. On an
 
 ### Bulk upload
 
-For each batch of files the application reads all `ArrayBuffer` payloads in parallel, encrypts the batch in parallel, then writes every encrypted record to IndexedDB in a **single transaction**, eliminating the per-file transaction overhead that would otherwise dominate for large numbers of small files.
+For each batch of files the application reads all `ArrayBuffer` payloads in parallel, encrypts the batch in parallel, then writes every encrypted record to IndexedDB in a **single transaction**, eliminating the per-file transaction overhead that would otherwise dominate for large numbers of small files. Files with encrypted blobs exceeding **50 MB** are stored as split 50 MB chunks across the `chunks` object store, avoiding the browser's ~2 GB structured-clone limit on IndexedDB reads; the chunking is fully transparent to all read paths.
 
 ### ZIP export
 
