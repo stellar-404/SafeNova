@@ -50,16 +50,27 @@ async function _getOrCreateSessionKey() {
     if (stored) {
         try {
             const raw = Uint8Array.from(atob(stored), ch => ch.charCodeAt(0));
-            _sessionKey = await crypto.subtle.importKey('raw', raw, { name: 'AES-GCM' }, false, ['encrypt', 'decrypt']);
-            return _sessionKey;
+            try {
+                _sessionKey = await crypto.subtle.importKey('raw', raw, { name: 'AES-GCM' }, false, ['encrypt', 'decrypt']);
+                return _sessionKey;
+            } finally {
+                raw.fill(0);
+            }
         } catch { /* corrupted — regenerate below */ }
     }
-    const raw = crypto.getRandomValues(new Uint8Array(32)),
-        exp = await crypto.subtle.importKey('raw', raw, { name: 'AES-GCM' }, true, ['encrypt', 'decrypt']),
-        exported = await crypto.subtle.exportKey('raw', exp);
-    sessionStorage.setItem('snv-sk', btoa(String.fromCharCode(...new Uint8Array(exported))));
-    _sessionKey = await crypto.subtle.importKey('raw', exported, { name: 'AES-GCM' }, false, ['encrypt', 'decrypt']);
-    return _sessionKey;
+    const raw = crypto.getRandomValues(new Uint8Array(32));
+    let exportedU8 = null;
+    try {
+        const exp = await crypto.subtle.importKey('raw', raw, { name: 'AES-GCM' }, true, ['encrypt', 'decrypt']),
+            exported = await crypto.subtle.exportKey('raw', exp);
+        exportedU8 = new Uint8Array(exported);
+        sessionStorage.setItem('snv-sk', btoa(String.fromCharCode(...exportedU8)));
+        _sessionKey = await crypto.subtle.importKey('raw', exported, { name: 'AES-GCM' }, false, ['encrypt', 'decrypt']);
+        return _sessionKey;
+    } finally {
+        raw.fill(0);
+        if (exportedU8) exportedU8.fill(0);
+    }
 }
 
 /* ── Browser fingerprint → HKDF wrap-key (never stored) ──
@@ -210,18 +221,24 @@ async function _getOrCreateBrowserWrapKey() {
     combined[fpBytes.length + 1 + 32] = 0;
     combined.set(idbPart, fpBytes.length + 1 + 32 + 1);
 
-    const hkdf = await crypto.subtle.importKey('raw', combined, 'HKDF', false, ['deriveKey']),
-        salt = new Uint8Array(32), // all-zero deterministic salt
-        info = new TextEncoder().encode('snv-browser-wrap-v2');
-    _browserWrapKey = await crypto.subtle.deriveKey(
-        { name: 'HKDF', hash: 'SHA-256', salt, info },
-        hkdf,
-        { name: 'AES-GCM', length: 256 },
-        false,
-        ['encrypt', 'decrypt']
-    );
-    InitLog.done('wrap-key: HKDF derive');
-    return _browserWrapKey;
+    try {
+        const hkdf = await crypto.subtle.importKey('raw', combined, 'HKDF', false, ['deriveKey']),
+            salt = new Uint8Array(32), // all-zero deterministic salt
+            info = new TextEncoder().encode('snv-browser-wrap-v2');
+        _browserWrapKey = await crypto.subtle.deriveKey(
+            { name: 'HKDF', hash: 'SHA-256', salt, info },
+            hkdf,
+            { name: 'AES-GCM', length: 256 },
+            false,
+            ['encrypt', 'decrypt']
+        );
+        InitLog.done('wrap-key: HKDF derive');
+        return _browserWrapKey;
+    } finally {
+        combined.fill(0);
+        cookiePart.fill(0);
+        idbPart.fill(0);
+    }
 }
 
 /* ── Browser-scope session key (localStorage, shared across all tabs, wrap-encrypted) ── */
@@ -256,6 +273,8 @@ async function _getOrCreateBrowserScopeKey() {
                 newBlob.set(new Uint8Array(ct), 12);
                 localStorage.setItem('snv-bsk', btoa(String.fromCharCode(...newBlob)));
                 _browserScopeKey = await crypto.subtle.importKey('raw', rawExported, { name: 'AES-GCM' }, false, ['encrypt', 'decrypt']);
+                new Uint8Array(rawExported).fill(0);
+                blobBytes.fill(0);
                 InitLog.done('browser-scope-key', 'legacy-migrated');
                 return _browserScopeKey;
             } catch { /* corrupted legacy key — regenerate below */ }
@@ -265,22 +284,31 @@ async function _getOrCreateBrowserScopeKey() {
                 const iv = blobBytes.slice(0, 12), ct = blobBytes.slice(12);
                 const raw = await crypto.subtle.decrypt({ name: 'AES-GCM', iv }, wrapKey, ct);
                 _browserScopeKey = await crypto.subtle.importKey('raw', raw, { name: 'AES-GCM' }, false, ['encrypt', 'decrypt']);
+                new Uint8Array(raw).fill(0);
+                blobBytes.fill(0);
                 InitLog.done('browser-scope-key', 'existing');
                 return _browserScopeKey;
             } catch { /* fingerprint changed or corrupted — regenerate below */ }
         }
     }
     // Generate fresh snv-bsk and wrap it with the browser-specific key before storing
-    const raw = crypto.getRandomValues(new Uint8Array(32)),
-        wrapIV = crypto.getRandomValues(new Uint8Array(12)),
-        ct = await crypto.subtle.encrypt({ name: 'AES-GCM', iv: wrapIV }, wrapKey, raw),
-        blob = new Uint8Array(12 + ct.byteLength);
-    blob.set(wrapIV);
-    blob.set(new Uint8Array(ct), 12);
-    localStorage.setItem('snv-bsk', btoa(String.fromCharCode(...blob)));
-    _browserScopeKey = await crypto.subtle.importKey('raw', raw, { name: 'AES-GCM' }, false, ['encrypt', 'decrypt']);
-    InitLog.done('browser-scope-key', 'new');
-    return _browserScopeKey;
+    const raw = crypto.getRandomValues(new Uint8Array(32));
+    let rawCopy = null;
+    try {
+        const wrapIV = crypto.getRandomValues(new Uint8Array(12)),
+            ct = await crypto.subtle.encrypt({ name: 'AES-GCM', iv: wrapIV }, wrapKey, raw),
+            blob = new Uint8Array(12 + ct.byteLength);
+        blob.set(wrapIV);
+        blob.set(new Uint8Array(ct), 12);
+        localStorage.setItem('snv-bsk', btoa(String.fromCharCode(...blob)));
+        rawCopy = raw.slice();
+        _browserScopeKey = await crypto.subtle.importKey('raw', rawCopy, { name: 'AES-GCM' }, false, ['encrypt', 'decrypt']);
+        InitLog.done('browser-scope-key', 'new');
+        return _browserScopeKey;
+    } finally {
+        raw.fill(0);
+        if (rawCopy) rawCopy.fill(0);
+    }
 }
 
 // Browser-scope sessions expire after 7 days; tab-scope persist until tab closes
@@ -291,23 +319,35 @@ async function _encryptSessionPayload(key, cid, rawKeyBytes, expiryMs) {
         payload = new Uint8Array(8 + rawKeyBytes.length);
     new DataView(payload.buffer).setBigUint64(0, BigInt(expiryMs), true);
     payload.set(rawKeyBytes, 8);
-    const aad = new TextEncoder().encode('snv-session:' + cid),
-        ct = await crypto.subtle.encrypt({ name: 'AES-GCM', iv, additionalData: aad }, key, payload),
-        blob = new Uint8Array(12 + ct.byteLength);
-    blob.set(iv);
-    blob.set(new Uint8Array(ct), 12);
-    return btoa(String.fromCharCode(...blob));
+    try {
+        const aad = new TextEncoder().encode('snv-session:' + cid),
+            ct = await crypto.subtle.encrypt({ name: 'AES-GCM', iv, additionalData: aad }, key, payload),
+            blob = new Uint8Array(12 + ct.byteLength);
+        blob.set(iv);
+        blob.set(new Uint8Array(ct), 12);
+        return btoa(String.fromCharCode(...blob));
+    } finally {
+        payload.fill(0);
+    }
 }
 
 async function _decryptSessionPayload(key, cid, b64) {
     const blob = Uint8Array.from(atob(b64), ch => ch.charCodeAt(0)),
         iv = blob.slice(0, 12), ct = blob.slice(12);
-    const aad = new TextEncoder().encode('snv-session:' + cid),
-        dec = await crypto.subtle.decrypt({ name: 'AES-GCM', iv, additionalData: aad }, key, ct),
-        payload = new Uint8Array(dec),
-        expiry = Number(new DataView(payload.buffer).getBigUint64(0, true));
-    if (Date.now() > expiry) return null; // expired
-    return payload.slice(8); // 32-byte raw key material
+    let payload = null;
+    try {
+        const aad = new TextEncoder().encode('snv-session:' + cid),
+            dec = await crypto.subtle.decrypt({ name: 'AES-GCM', iv, additionalData: aad }, key, ct);
+        payload = new Uint8Array(dec);
+        const expiry = Number(new DataView(payload.buffer).getBigUint64(0, true));
+        if (Date.now() > expiry) return null; // expired
+        return payload.slice(8); // 32-byte raw key material
+    } finally {
+        if (payload) payload.fill(0);
+        blob.fill(0);
+        iv.fill(0);
+        ct.fill(0);
+    }
 }
 
 // rawKeyBytes — Uint8Array(32) from Crypto.deriveRaw(), never the plaintext password
@@ -369,6 +409,21 @@ async function loadSession(cid) {
 function clearSession(cid) {
     sessionStorage.removeItem('snv-s-' + cid);
     localStorage.removeItem('snv-sb-' + cid);
+    // Drop cached session key if no sessions remain
+    _dropSessionKeyIfUnused();
+}
+
+function _dropSessionKeyIfUnused() {
+    for (let i = 0; i < sessionStorage.length; i++) {
+        const k = sessionStorage.key(i);
+        if (k && k.startsWith('snv-s-')) return;
+    }
+    for (let i = 0; i < localStorage.length; i++) {
+        const k = localStorage.key(i);
+        if (k && k.startsWith('snv-sb-')) return;
+    }
+    _sessionKey = null;
+    sessionStorage.removeItem('snv-sk');
 }
 
 function hasSession(cid) {
@@ -478,6 +533,10 @@ const App = {
         document.title = 'SafeNova';
         if (this.container?.id) _stopContainerSession(this.container.id);
         this.key = null;
+        // Paranoid: scrub container object before releasing to GC
+        if (this.container) {
+            for (let k of Object.keys(this.container)) this.container[k] = null;
+        }
         this.container = null;
         this.folder = 'root';
         this.selection = new Set();
@@ -501,6 +560,10 @@ const App = {
         const cid = this.container?.id;
         if (cid) { _stopContainerSession(cid); clearSession(cid); }
         this.key = null;
+        // Paranoid: scrub container object before releasing to GC
+        if (this.container) {
+            for (let k of Object.keys(this.container)) this.container[k] = null;
+        }
         this.container = null;
         this.folder = 'root';
         this.selection = new Set();

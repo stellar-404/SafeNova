@@ -315,11 +315,16 @@ async function doChangePassword() {
         showLoading('Re-encrypting VFS…');
         const vfsRec = await DB.getVFS(c.id);
         if (vfsRec) {
-            const vfsBuf = typeof vfsRec.blob === 'string'
-                ? await Crypto.decrypt(oldKey, vfsRec.iv, vfsRec.blob)
-                : await Crypto.decryptBin(oldKey, vfsRec.iv, vfsRec.blob);
-            const { iv: newVfsIv, blob: newVfsBlob } = await Crypto.encryptBin(newKey, vfsBuf);
-            await DB.saveVFS(c.id, newVfsIv, newVfsBlob);
+            let vfsBuf = null;
+            try {
+                vfsBuf = typeof vfsRec.blob === 'string'
+                    ? await Crypto.decrypt(oldKey, vfsRec.iv, vfsRec.blob)
+                    : await Crypto.decryptBin(oldKey, vfsRec.iv, vfsRec.blob);
+                const { iv: newVfsIv, blob: newVfsBlob } = await Crypto.encryptBin(newKey, vfsBuf);
+                await DB.saveVFS(c.id, newVfsIv, newVfsBlob);
+            } finally {
+                if (vfsBuf) new Uint8Array(vfsBuf).fill(0);
+            }
         }
 
         // Expand lazy workspace (if never unlocked) so file blobs enter the re-encryption pass below.
@@ -350,11 +355,16 @@ async function doChangePassword() {
         let _reencDone = 0;
         const reencResults = await Promise.allSettled(files.map(async f => {
             const buf = await Crypto.decryptBin(oldKey, f.iv, f.blob);
-            const { iv, blob } = await Crypto.encryptBin(newKey, buf);
-            _reencDone++;
-            if (_reencDone % 4 === 0 || _reencDone === files.length)
-                showLoading(`Re-encrypting files\u2026 ${_reencDone}/${files.length}`);
-            return { id: f.id, cid: f.cid, iv: Array.from(iv), blob };
+            try {
+                const { iv, blob } = await Crypto.encryptBin(newKey, buf);
+                _reencDone++;
+                if (_reencDone % 4 === 0 || _reencDone === files.length)
+                    showLoading(`Re-encrypting files\u2026 ${_reencDone}/${files.length}`);
+                return { id: f.id, cid: f.cid, iv: Array.from(iv), blob };
+            } finally {
+                // Wipe decrypted plaintext buffer
+                new Uint8Array(buf).fill(0);
+            }
         }));
         const reencFiles = reencResults
             .filter(r => r.status === 'fulfilled')
@@ -817,6 +827,8 @@ async function doUnlock() {
             // Checkbox unchecked — clear any previously saved session
             clearSession(c.id);
         }
+        // Wipe raw key bytes — CryptoKey (App.key) holds it internally
+        _sessionRawKey.fill(0);
     } catch (e) {
         document.getElementById('unlock-error').innerHTML = '<svg width="14" height="14" viewBox="0 0 16 16" fill="none"><path d="M8 1.5a6.5 6.5 0 100 13 6.5 6.5 0 000-13zM7.25 5h1.5v4h-1.5V5zm0 5h1.5v1.5h-1.5V10z" fill="currentColor"/></svg> ' + escHtml(e.message);
         console.error(e);
@@ -857,7 +869,10 @@ async function deleteContainerConfirmed() {
 async function _resumeSession(c, rawKeyBytes) {
     showLoading('Restoring session...');
     try {
-        const key = await Crypto.importRawKey(rawKeyBytes),
+        // Wipe raw key bytes after import — CryptoKey will hold the key internally
+        const key = await Crypto.importRawKey(rawKeyBytes);
+        rawKeyBytes.fill(0);
+        const
             ok = await Crypto.checkVerification(key, c.verIv, c.verBlob);
         if (!ok) {
             // Stored session is invalid (password changed?) — clear it and open unlock view

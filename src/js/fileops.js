@@ -51,6 +51,8 @@ async function uploadFiles(files) {
                 mime = f.type || getMime(name),
                 { iv, blob } = await Crypto.encryptBin(App.key, bufs[bi]),
                 nodeId = uid();
+            // Wipe plaintext buffer after encryption
+            new Uint8Array(bufs[bi]).fill(0);
             VFS.add({
                 id: nodeId, type: 'file', name, mime, size: f.size,
                 parentId: App.folder, ctime: Date.now(), mtime: Date.now()
@@ -114,6 +116,8 @@ async function _uploadFileEntry(fileEntry, targetFolderId) {
         mime = file.type || getMime(name),
         { iv, blob } = await Crypto.encryptBin(App.key, buf),
         nodeId = uid(), now = Date.now();
+    // Wipe plaintext buffer after encryption
+    new Uint8Array(buf).fill(0);
     VFS.add({
         id: nodeId, type: 'file', name, mime, size: file.size,
         parentId: targetFolderId, ctime: now, mtime: now
@@ -234,6 +238,8 @@ async function downloadFile(node) {
         if (!rec) { toast('File data not found', 'error'); hideLoading(); return; }
         const buf = await Crypto.decryptBin(App.key, rec.iv, rec.blob);
         downloadBuf(buf, node.name, node.mime || getMime(node.name));
+        // Wipe decrypted plaintext after download is initiated
+        new Uint8Array(buf).fill(0);
         toast('Exported: ' + node.name, 'success');
         logActivity('download', node.name, 1, VFS.fullPath(node.id));
     } catch (e) { toast('Decryption failed: ' + e.message, 'error'); }
@@ -255,6 +261,9 @@ function _confirmExport(node, buf, mime) {
     document.getElementById('ec-ok').onclick = () => {
         Overlay.hide();
         downloadBuf(buf, node.name, mime);
+        // Wipe decrypted plaintext after download is initiated
+        if (buf instanceof ArrayBuffer) new Uint8Array(buf).fill(0);
+        else if (buf instanceof Uint8Array) buf.fill(0);
         toast('Exported: ' + node.name, 'success');
         logActivity('download', node.name, 1, VFS.fullPath(node.id));
     };
@@ -789,6 +798,9 @@ let _editorOriginal = '';
 function openEditor(node, buf) {
     _editorNode = node;
     const raw = new TextDecoder().decode(buf);
+    // Wipe the decrypted ArrayBuffer now that we have the string
+    if (buf instanceof ArrayBuffer) new Uint8Array(buf).fill(0);
+    else if (buf instanceof Uint8Array) buf.fill(0);
     // Normalize line endings to \n to match what <textarea> returns
     const text = raw.replace(/\r\n/g, '\n').replace(/\r/g, '\n');
     _editorOriginal = text;
@@ -922,6 +934,9 @@ function openViewer(node, buf, mime) {
     content.innerHTML = '';
     const blobObj = new Blob([buf], { type: mime }),
         url = URL.createObjectURL(blobObj);
+    // Wipe the decrypted ArrayBuffer now that the Blob holds the data
+    if (buf instanceof ArrayBuffer) new Uint8Array(buf).fill(0);
+    else if (buf instanceof Uint8Array) buf.fill(0);
     _viewerBlob = { url, node };
 
     document.getElementById('viewer-title').textContent = node.name;
@@ -1327,6 +1342,10 @@ async function exportAsZip(nodeIds, zipName) {
         if (!entries.length) { toast('Nothing to export', 'warn'); hideLoading(); return; }
         const zipParts = _buildZip(entries);
         downloadBuf(zipParts, zipName, 'application/zip');
+        // Wipe decrypted file data after ZIP is built
+        for (const e of entries) {
+            if (e.data instanceof Uint8Array) e.data.fill(0);
+        }
         toast(`Exported ${entries.length} file${entries.length !== 1 ? 's' : ''} as ZIP`, 'success');
         logActivity('export-zip', nodeIds.length === 1 ? (VFS.node(nodeIds[0])?.name ?? entries[0]?.name ?? '1 file') : `${entries.length} files`, entries.length, nodeIds.length === 1 ? VFS.fullPath(nodeIds[0]) : null);
     } catch (e) { toast('ZIP export failed: ' + e.message, 'error'); console.error(e); }

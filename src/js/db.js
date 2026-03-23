@@ -37,7 +37,14 @@ const DB = (() => {
                     InitLog.done('DB schema upgrade');
                 } catch (err) { InitLog.error('DB schema upgrade', err); fail(err); }
             };
-            req.onsuccess = e => done(e.target.result);
+            req.onsuccess = e => {
+                const db = e.target.result;
+                db.onversionchange = () => {
+                    try { db.close(); } catch { }
+                    _db = null;
+                };
+                done(db);
+            };
             req.onerror = () => fail(req.error);
             req.onblocked = () => {
                 // Another connection prevents upgrade; close it by requesting versionchange on self
@@ -48,8 +55,11 @@ const DB = (() => {
         });
     }
 
-    function rw(store) { return _db.transaction(store, 'readwrite').objectStore(store); }
-    function ro(store) { return _db.transaction(store, 'readonly').objectStore(store); }
+    function _ensureDb() {
+        if (!_db) throw new Error('Database is not initialized');
+    }
+    function rw(store) { _ensureDb(); return _db.transaction(store, 'readwrite').objectStore(store); }
+    function ro(store) { _ensureDb(); return _db.transaction(store, 'readonly').objectStore(store); }
     function wrap(req) { return new Promise((r, j) => { req.onsuccess = () => r(req.result); req.onerror = () => j(req.error); }); }
 
     // Reassemble a chunked file record: reads N chunks from 'chunks' store,
