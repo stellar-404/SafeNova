@@ -57,11 +57,11 @@ SafeNova uses a **dual-key model** for session storage — an ephemeral per-tab 
 
 #### Current tab session _(Recommended)_
 
-The 32-byte Argon2id key material is encrypted with **`snv-sk`** — a per-tab AES-256-GCM key stored in `sessionStorage`. This means:
+The 32-byte Argon2id key material is encrypted with **`snv-sk`** — a per-tab AES-256-GCM key stored in `sessionStorage`. `snv-sk` is itself wrap-encrypted with the same three-source HKDF key as `snv-bsk` before being written to `sessionStorage`. This means:
 
 -   The session blob (`snv-s-{cid}`) lives in `sessionStorage` and is readable only by the exact tab that created it
 -   Closing the tab permanently destroys `snv-sk` — no residue remains in any persistent storage
--   An attacker with access to `localStorage` or disk snapshots gains nothing, because the decryption key exists only in volatile `sessionStorage`
+-   An attacker with access to `localStorage`, `sessionStorage`, or disk snapshots gains nothing — even a raw `sessionStorage` dump does not expose the decryption key without also possessing the browser fingerprint, the `snv-kc` cookie, and the `SafeNovaKS` IDB record
 
 This is the recommended option: the session is automatically gone as soon as the tab is closed.
 
@@ -75,14 +75,15 @@ Before `snv-bsk` is written to `localStorage`, it is itself encrypted with a sep
 
 | #   | Source              | Storage                                       | Purpose                                                                 |
 | --- | ------------------- | --------------------------------------------- | ----------------------------------------------------------------------- |
-| 1   | Browser fingerprint | _(computed)_                                  | `origin \0 language \0 hardwareConcurrency \0 colorDepth \0 pixelDepth` |
+| 1   | Browser fingerprint | _(computed)_                                  | `origin \0 userAgent \0 platform \0 language \0 hardwareConcurrency \0 colorDepth \0 pixelDepth` |
 | 2   | `snv-kc` cookie     | Cookie jar (`SameSite=Strict`, ~400 days TTL) | 32 random bytes, isolated from localStorage                             |
 | 3   | `snv-ki` record     | Separate IndexedDB `SafeNovaKS`               | 32 random bytes, independent from main `SafeNovaEFS` database           |
 
 ```
 ikm      = fingerprint \0 cookie_bytes(32) \0 idb_bytes(32)
-wrap_key = HKDF-SHA-256( ikm, salt=0×32, info="snv-browser-wrap-v2" )
-snv-bsk (localStorage) = IV(12) || AES-256-GCM( wrap_key, raw_bsk_bytes )
+wrap_key = HKDF-SHA-256( ikm, salt=0×32, info="snv-browser-wrap-v3" )
+snv-bsk (localStorage)   = IV(12) || AES-256-GCM( wrap_key, raw_bsk_bytes )
+snv-sk  (sessionStorage) = IV(12) || AES-256-GCM( wrap_key, raw_sk_bytes  )
 ```
 
 Consequences:
@@ -92,9 +93,9 @@ Consequences:
     -   Copying `localStorage` without the cookie and `SafeNovaKS` database → wrap key cannot be derived → `snv-bsk` is opaque
     -   Clearing cookies invalidates the cookie component → sessions become undecryptable
     -   Deleting or moving the `SafeNovaKS` database invalidates the IDB component → same effect
--   The fingerprint is intentionally **stable**: `navigator.userAgent` and `navigator.platform` are excluded because Chrome auto-updates silently (changing the UA string between launches), which would otherwise invalidate sessions on every browser update. Only properties that rarely or never change are used: deployment origin, system language, CPU core count, and display color depth
+-   The fingerprint includes `navigator.userAgent` and `navigator.platform`, binding sessions to the specific browser version and OS. **Browser updates that change the UA string will invalidate existing sessions** — the user re-enters their password once and a new session is established automatically
 -   If any of the three components change (fingerprint shift, cookie clearing, IDB loss), the stored `snv-bsk` can no longer be decrypted; a new key is generated automatically and the user must re-enter the password once — any `snv-sb-{cid}` blobs encrypted with the old key are silently dropped
--   **Legacy format migration:** `snv-bsk` entries written before fingerprint-wrapping was introduced (raw 32-byte keys, no IV prefix) are detected by their exact byte length and silently re-wrapped in the current `IV(12) || AES-GCM` format on first access — no user action required
+-   **Legacy format migration:** `snv-bsk` and `snv-sk` entries written before wrap-encryption was introduced (raw 32-byte keys, no IV prefix) are detected by their exact byte length and silently re-wrapped in the current `IV(12) || AES-GCM` format on first access — no user action required
 -   The session expires after **7 days** (TTL baked into the encrypted payload), or immediately on explicit sign-out
 
 #### Session payload format

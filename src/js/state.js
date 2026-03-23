@@ -6,7 +6,11 @@
    Two distinct encryption keys are used, one per scope:
 
    Tab-scope  (snv-s-{cid}  in sessionStorage):
-   • Encrypted with snv-sk — a per-tab AES key in sessionStorage.
+   • Encrypted with snv-sk — a per-tab AES key stored in sessionStorage.
+   • snv-sk itself is wrap-encrypted with the same 3-source HKDF key
+     as snv-bsk before being written to sessionStorage, so a raw dump
+     of sessionStorage cannot recover the key without also possessing
+     the browser fingerprint, snv-kc cookie, and SafeNovaKS IDB record.
    • Survives page refresh within the same tab; dies when the tab
      is closed (sessionStorage is wiped).
 
@@ -15,8 +19,9 @@
    • snv-bsk itself is AES-GCM-encrypted before being stored — the
      wrapping key is derived on-the-fly via HKDF from THREE independent
      sources and NEVER written to any storage:
-       1. Browser fingerprint (origin, language, hardwareConcurrency,
-          colorDepth, pixelDepth) — deterministic, stable.
+       1. Browser fingerprint (origin, userAgent, platform, language,
+          hardwareConcurrency, colorDepth, pixelDepth) — ties sessions
+          to the specific browser version and OS environment.
        2. 32 random bytes in a cookie (snv-kc, SameSite=Strict) —
           survives across sessions, isolated from localStorage.
        3. 32 random bytes in a separate IndexedDB (SafeNovaKS) —
@@ -26,9 +31,8 @@
      Copying localStorage alone is useless — without the matching
      cookie AND the SafeNovaKS database AND the same browser
      fingerprint, snv-bsk is undecryptable.
-     NOTE: navigator.userAgent is intentionally excluded from the
-     fingerprint because Chrome auto-updates silently and would
-     invalidate the session on every update.
+     Browser updates that change the UA string will invalidate sessions;
+     the user re-enters their password once and a new session is created.
    • Survives browser restarts until the 7-day TTL expires or the
      user explicitly signs out.
 
@@ -41,30 +45,52 @@
      cookie, and SafeNovaKS IndexedDB.
    ============================================================ */
 
-/* ── Tab-scope session key (sessionStorage, per-tab) ── */
+/* ── Tab-scope session key (sessionStorage, per-tab, wrap-encrypted) ── */
 let _sessionKey = null;
 
 async function _getOrCreateSessionKey() {
     if (_sessionKey) return _sessionKey;
+    // snv-sk is wrap-encrypted with the same 3-source browser wrap key as snv-bsk,
+    // so a raw sessionStorage dump cannot recover the inner key without also
+    // possessing the fingerprint, snv-kc cookie, and SafeNovaKS IDB record.
+    const wrapKey = await _getOrCreateBrowserWrapKey();
     const stored = sessionStorage.getItem('snv-sk');
     if (stored) {
         try {
-            const raw = Uint8Array.from(atob(stored), ch => ch.charCodeAt(0));
+            const blobBytes = Uint8Array.from(atob(stored), ch => ch.charCodeAt(0));
+            // Legacy format (pre-wrap): exactly 32 raw bytes stored plain — migrate on-the-fly
+            if (blobBytes.length === 32) {
+                const wrapIV = crypto.getRandomValues(new Uint8Array(12)),
+                    ct = await crypto.subtle.encrypt({ name: 'AES-GCM', iv: wrapIV }, wrapKey, blobBytes),
+                    blob = new Uint8Array(12 + ct.byteLength);
+                blob.set(wrapIV);
+                blob.set(new Uint8Array(ct), 12);
+                sessionStorage.setItem('snv-sk', btoa(String.fromCharCode(...blob)));
+                _sessionKey = await crypto.subtle.importKey('raw', blobBytes, { name: 'AES-GCM' }, false, ['encrypt', 'decrypt']);
+                return _sessionKey;
+            }
+            // Current format: IV(12) + AES-GCM(CT) wrapping the 32-byte raw key
+            const iv = blobBytes.slice(0, 12), ct = blobBytes.slice(12);
+            const raw = await crypto.subtle.decrypt({ name: 'AES-GCM', iv }, wrapKey, ct);
             _sessionKey = await crypto.subtle.importKey('raw', raw, { name: 'AES-GCM' }, false, ['encrypt', 'decrypt']);
             return _sessionKey;
-        } catch { /* corrupted — regenerate below */ }
+        } catch { /* corrupted or fingerprint changed — regenerate below */ }
     }
+    // Generate fresh snv-sk and wrap it with the browser wrap key before storing
     const raw = crypto.getRandomValues(new Uint8Array(32)),
-        exp = await crypto.subtle.importKey('raw', raw, { name: 'AES-GCM' }, true, ['encrypt', 'decrypt']),
-        exported = await crypto.subtle.exportKey('raw', exp);
-    sessionStorage.setItem('snv-sk', btoa(String.fromCharCode(...new Uint8Array(exported))));
-    _sessionKey = await crypto.subtle.importKey('raw', exported, { name: 'AES-GCM' }, false, ['encrypt', 'decrypt']);
+        wrapIV = crypto.getRandomValues(new Uint8Array(12)),
+        ct = await crypto.subtle.encrypt({ name: 'AES-GCM', iv: wrapIV }, wrapKey, raw),
+        blob = new Uint8Array(12 + ct.byteLength);
+    blob.set(wrapIV);
+    blob.set(new Uint8Array(ct), 12);
+    sessionStorage.setItem('snv-sk', btoa(String.fromCharCode(...blob)));
+    _sessionKey = await crypto.subtle.importKey('raw', raw, { name: 'AES-GCM' }, false, ['encrypt', 'decrypt']);
     return _sessionKey;
 }
 
 /* ── Browser fingerprint → HKDF wrap-key (never stored) ──
    The wrap-key is derived from THREE independent sources:
-   1. Browser fingerprint (deterministic, stable across sessions)
+   1. Browser fingerprint (browser+OS environment, see below)
    2. Random 32-byte secret stored in a cookie (snv-kc)
    3. Random 32-byte secret stored in a SEPARATE IndexedDB (SafeNovaKS)
 
@@ -74,19 +100,24 @@ async function _getOrCreateSessionKey() {
    • A disk image copy lacks the cookie (browser-bound)
    • Clearing cookies or the key-store IDB invalidates the key
 
-   Intentionally excludes navigator.userAgent (changes on every
-   Chrome silent auto-update) and navigator.platform (deprecated).
-   Properties used are stable across browser version updates. */
+   Includes navigator.userAgent and navigator.platform to bind sessions
+   to the specific browser version and OS. Browser updates that change
+   the UA string will invalidate existing sessions — the user re-enters
+   their password once and a new session is established automatically.
+   Also used as the wrap key for snv-sk (sessionStorage), so both
+   storage types require the same 3-source credential to recover. */
 let _browserWrapKey = null;
 
 function _getBrowserFingerprint() {
     const n = navigator, s = screen;
     return [
-        window.location.origin,              // deployment-bound (stable)
-        n.language || '',          // system language (rarely changes)
-        String(n.hardwareConcurrency || 0),   // CPU core count (stable)
-        String(s.colorDepth || 0),     // display bit depth (stable)
-        String(s.pixelDepth || 0),
+        window.location.origin,              // deployment-bound
+        n.userAgent        || '',            // browser + OS version
+        n.platform         || '',            // OS/CPU platform
+        n.language         || '',            // system language
+        String(n.hardwareConcurrency || 0),  // CPU core count
+        String(s.colorDepth  || 0),          // display bit depth
+        String(s.pixelDepth  || 0),
     ].join('\x00');
 }
 
@@ -212,7 +243,7 @@ async function _getOrCreateBrowserWrapKey() {
 
     const hkdf = await crypto.subtle.importKey('raw', combined, 'HKDF', false, ['deriveKey']),
         salt = new Uint8Array(32), // all-zero deterministic salt
-        info = new TextEncoder().encode('snv-browser-wrap-v2');
+        info = new TextEncoder().encode('snv-browser-wrap-v3');
     _browserWrapKey = await crypto.subtle.deriveKey(
         { name: 'HKDF', hash: 'SHA-256', salt, info },
         hkdf,
